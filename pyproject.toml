@@ -1,0 +1,113 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "redsun-adaptive-holotomography"
+version = "0.1.0.dev0"
+description = "Reusable acquisition and processing components for adaptive holotomography"
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.12"
+classifiers = [
+  "Development Status :: 2 - Pre-Alpha",
+  "Intended Audience :: Developers",
+  "Intended Audience :: Science/Research",
+  "License :: OSI Approved :: Apache Software License",
+  "Operating System :: OS Independent",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
+  "Topic :: Scientific/Engineering",
+]
+dependencies = [
+  "dependency-injector>=4.48,<5",
+  "msgspec>=0.21.1,<0.22",
+  "redsun[zarr]==0.11.0",
+]
+
+[dependency-groups]
+dev = [
+  "mypy>=2.3.0",
+  "pre-commit>=4.5.0",
+  "pytest>=9.0.2",
+  "pytest-cov>=7.0.0",
+  "ruff>=0.16.0",
+  "types-PyYAML>=6.0.12.20250915",
+]
+
+[project.optional-dependencies]
+pyqt = [
+  "napari[pyqt6]>=0.6.6",
+  "redsun[pyqt]==0.11.0",
+]
+pyside = [
+  "napari[pyside6]>=0.6.6",
+  "redsun[pyside]==0.11.0",
+]
+
+[project.scripts]
+aht = "redsun_aht.__main__:main"
+
+[project.entry-points."redsun.plugins"]
+redsun-aht = "redsun.yaml"
+
+[tool.hatch.build.targets.sdist]
+include = ["src", "tests", "docs"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/redsun_aht"]
+
+[tool.coverage.run]
+branch = true
+source = ["redsun_aht"]
+omit = ["src/redsun_aht/protocols.py"]
+
+[tool.coverage.report]
+exclude_lines = [
+  "@abstractmethod",
+  "if TYPE_CHECKING:",
+  "@overload",
+  "class .*Protocol",
+  "pragma: no cover",
+  "raise NotImplementedError",
+]
+fail_under = 90
+show_missing = true
+
+[tool.mypy]
+files = ["src", "tests"]
+pretty = true
+strict = true
+warn_no_return = true
+warn_unreachable = true
+disable_error_code = ["import-untyped"]
+
+[tool.pytest.ini_options]
+minversion = "9.0"
+addopts = "--strict-config --strict-markers"
+testpaths = ["tests"]
+markers = [
+  "hardware: requires explicitly enabled physical hardware",
+]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 88
+
+[tool.ruff.format]
+docstring-code-format = true
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "D", "TC", "PERF", "RUF"]
+ignore = ["D100", "D104", "D107"]
+
+[tool.ruff.lint.per-file-ignores]
+"src/redsun_aht/domain/models.py" = ["D105"]
+"src/redsun_aht/protocols.py" = ["D102"]
+"tests/*.py" = ["D", "TC"]
+
+[tool.ruff.lint.pydocstyle]
+convention = "numpy"
