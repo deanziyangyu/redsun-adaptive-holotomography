@@ -136,6 +136,24 @@ class CoreLike(Protocol):
 
     def setROI(self, x: int, y: int, width: int, height: int) -> None: ...
 
+    def clearCircularBuffer(self) -> None: ...
+
+    def setCircularBufferMemoryFootprint(self, size_mb: int) -> None: ...
+
+    def initializeCircularBuffer(self) -> None: ...
+
+    def startSequenceAcquisition(
+        self, frame_count: int, interval_ms: float, stop_on_overflow: bool
+    ) -> None: ...
+
+    def startContinuousSequenceAcquisition(self, interval_ms: float) -> None: ...
+
+    def getRemainingImageCount(self) -> int: ...
+
+    def popNextImage(self) -> object: ...
+
+    def isBufferOverflowed(self) -> bool: ...
+
     def stopSequenceAcquisition(self) -> None: ...
 
     def unloadAllDevices(self) -> None: ...
@@ -165,6 +183,7 @@ class MMCoreCameraBackend:
         self._core: CoreLike | None = None
         self._identity: CameraIdentity | None = None
         self._armed = False
+        self._sequence_active = False
 
     @property
     def connected(self) -> bool:
@@ -241,18 +260,76 @@ class MMCoreCameraBackend:
         self._armed = True
 
     def trigger(self) -> npt.NDArray[Any]:
-        """Acquire one frame from the admitted camera."""
+        """Acquire one explicitly requested frame with ``snapImage``.
+
+        This remains the validation and broad-compatibility path. Live view and
+        list scans use :meth:`start_sequence` and :meth:`drain_sequence`.
+        """
         core = self._require_core()
+        if self._sequence_active:
+            raise RuntimeError("cannot snap while sequence acquisition is active")
         if not self._armed:
             raise RuntimeError("camera is not armed")
         core.snapImage()
         return np.asarray(core.getImage()).copy()
 
+    def start_sequence(
+        self,
+        *,
+        interval_ms: float = 0.0,
+        buffer_memory_mb: int = 128,
+        frame_count: int | None = None,
+    ) -> None:
+        """Start one MMCore-backed continuous or finite sequence.
+
+        ``frame_count=None`` is the live-view mode and uses MMCore's continuous
+        sequence API. A positive frame count is reserved for list scans and
+        uses ``startSequenceAcquisition``. The caller must drain frames through
+        :meth:`drain_sequence` before MMCore's circular buffer overflows.
+        """
+        if interval_ms < 0 or not np.isfinite(interval_ms):
+            raise ValueError("sequence interval_ms must be finite and non-negative")
+        if buffer_memory_mb <= 0:
+            raise ValueError("sequence buffer_memory_mb must be positive")
+        if frame_count is not None and frame_count <= 0:
+            raise ValueError("sequence frame_count must be positive when provided")
+        core = self._require_core()
+        if self._sequence_active:
+            raise RuntimeError("sequence acquisition is already active")
+        if self._armed:
+            raise RuntimeError("disarm single-frame capture before starting a sequence")
+        core.stopSequenceAcquisition()
+        core.clearCircularBuffer()
+        core.setCircularBufferMemoryFootprint(buffer_memory_mb)
+        core.initializeCircularBuffer()
+        if frame_count is None:
+            core.startContinuousSequenceAcquisition(interval_ms)
+        else:
+            core.startSequenceAcquisition(frame_count, interval_ms, True)
+        self._sequence_active = True
+
+    def drain_sequence(self) -> tuple[npt.NDArray[Any], ...]:
+        """Copy and remove every frame currently held by MMCore's ring."""
+        core = self._require_core()
+        if not self._sequence_active:
+            raise RuntimeError("sequence acquisition is not active")
+        remaining = int(core.getRemainingImageCount())
+        if remaining < 0:
+            raise RuntimeError("MMCore returned a negative image count")
+        return tuple(np.asarray(core.popNextImage()).copy() for _ in range(remaining))
+
+    def sequence_overflowed(self) -> bool:
+        """Return whether MMCore has reported a circular-buffer overflow."""
+        if not self._sequence_active:
+            return False
+        return bool(self._require_core().isBufferOverflowed())
+
     def stop(self) -> None:
-        """Stop sequence activity if present and disarm snapshots."""
+        """Stop sequence activity if present and disarm single-frame capture."""
         core = self._require_core()
         core.stopSequenceAcquisition()
         self._armed = False
+        self._sequence_active = False
 
     def disconnect(self) -> None:
         """Force shutter-safe cleanup and release the process-local core."""
@@ -263,6 +340,7 @@ class MMCoreCameraBackend:
         self._core = None
         self._identity = None
         self._armed = False
+        self._sequence_active = False
 
     def _validate_identity(self, core: CoreLike) -> CameraIdentity:
         label = core.getCameraDevice()

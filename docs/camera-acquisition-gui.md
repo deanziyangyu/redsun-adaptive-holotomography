@@ -1,12 +1,13 @@
 # One-frame camera acquisition GUI
 
-Status: implemented service client; physical PVCAM and FLIR one-frame gates
-passed on 2026-08-23. It is not a live continuous-acquisition application.
+Status: implemented service client. Physical PVCAM and FLIR one-frame gates
+passed on 2026-08-23; the live-view path is sequence-backed and has separate
+camera-only timing evidence. It is not a durable streaming-acquisition UI.
 
 `aht camera-gui --prefix PREFIX:` connects only to an already-running
 `aht-camera-ioc` service. The GUI contains no Micro-Manager, vendor SDK, stage,
-illumination, or MCU construction. Its single capture action follows this exact
-sequence:
+illumination, or MCU construction. Its **Capture one frame** action preserves
+the broad-compatibility validation path and follows this exact sequence:
 
 1. Request service connect and verify the admitted camera reaches `ready`.
 2. Arm and trigger exactly one service-owned lossless shared-memory frame.
@@ -28,11 +29,27 @@ qOBT, or IDT reconstruction: an unilluminated one-frame camera test has no
 native-v1 pattern sequence, illuminated sample, calibration, or measured pose
 series required by those scientific models.
 
-## High-rate non-goal
+## Sequence-backed live view
 
-This widget is not a live viewer. Repeatedly invoking its single-frame action
-would serialize camera trigger, shared-memory copy, checksum, EPICS metadata,
-and acknowledgement work, thereby throttling acquisition. A future GUI uses a
-separate latest-wins preview ring with an explicit decimation ratio (for
-example 1:10) and independently reported preview loss. It must never delay the
-lossless storage lane. See [camera streaming and backpressure](camera-streaming-backpressure.md).
+Repeatedly invoking the single-frame action would serialize camera trigger,
+shared-memory copy, checksum, EPICS metadata, and acknowledgement work,
+thereby throttling acquisition. The **Start live view** action instead starts
+one continuous MMCore sequence. The service drains MMCore's own circular buffer
+at a maximum 60 Hz, publishes only the newest image as an EPICS byte waveform,
+and records preview skips separately from buffer overruns. The GUI polls that
+latest-frame PV and never issues `TRIGGER` during live view.
+
+`snapImage()` is intentionally retained for **Capture one frame**, validation,
+and adapters that do not yet support sequence acquisition. Finite list scans
+use `startSequenceAcquisition(frame_count, interval_ms, stop_on_overflow)` at
+the backend boundary; the live viewer uses
+`startContinuousSequenceAcquisition(interval_ms)`. Neither preview mode is a
+durable streaming/storage contract. See [camera streaming and backpressure](camera-streaming-backpressure.md).
+
+For the 64x64 PVCAM FCS live profile, start the camera-only IOC from the
+admitted `pvcam_base.cfg` with `--pvcam-fcs-profile`; it explicitly applies the
+validated ROI, readout, clearing, trigger, and streaming settings after MMCore
+loads the base configuration. Leave `--live-publish-hz` at its 60 Hz default:
+the 2026-08-25 comparison found 10 Hz slightly slower (3.125 s versus 3.006 s
+for 2,000 frames) without reducing camera-buffer overruns, which were zero in
+both cases.

@@ -39,10 +39,18 @@ class CameraServiceDevice(EpicsDevice):
     descriptor_timestamp_ns: A[SignalR[str], PvSuffix("DESCRIPTOR_TIMESTAMP_NS")]
     descriptor_checksum_hi: A[SignalR[str], PvSuffix("DESCRIPTOR_CHECKSUM_HI")]
     descriptor_checksum_lo: A[SignalR[str], PvSuffix("DESCRIPTOR_CHECKSUM_LO")]
+    live_state: A[SignalR[str], PvSuffix("LIVE_STATE")]
+    live_publish_hz: A[SignalR[float], PvSuffix("LIVE_PUBLISH_HZ")]
+    live_sequence: A[SignalR[int], PvSuffix("LIVE_SEQUENCE")]
+    live_frames_drained: A[SignalR[int], PvSuffix("LIVE_FRAMES_DRAINED")]
+    live_frames_published: A[SignalR[int], PvSuffix("LIVE_FRAMES_PUBLISHED")]
+    live_frames_skipped: A[SignalR[int], PvSuffix("LIVE_FRAMES_SKIPPED")]
+    live_buffer_overruns: A[SignalR[int], PvSuffix("LIVE_BUFFER_OVERRUNS")]
 
     command_connect: A[TriggerableCommand, PvSuffix("COMMAND:CONNECT")]
     command_arm: A[TriggerableCommand, PvSuffix("COMMAND:ARM")]
     command_trigger: A[TriggerableCommand, PvSuffix("COMMAND:TRIGGER")]
+    command_start_live: A[TriggerableCommand, PvSuffix("COMMAND:START_LIVE")]
     command_stop: A[TriggerableCommand, PvSuffix("COMMAND:STOP")]
     command_disconnect: A[TriggerableCommand, PvSuffix("COMMAND:DISCONNECT")]
     command_acknowledge: A[SignalW[int], PvSuffix("COMMAND:ACKNOWLEDGE")]
@@ -60,6 +68,10 @@ class CameraServiceDevice(EpicsDevice):
     async def arm(self) -> None:
         """Ask the service to arm acquisition."""
         await self.command_arm.trigger()
+
+    async def start_live(self) -> None:
+        """Ask the service to start its sequence-backed live-view loop."""
+        await self.command_start_live.trigger()
 
     @AsyncStatus.wrap
     async def trigger(self) -> None:

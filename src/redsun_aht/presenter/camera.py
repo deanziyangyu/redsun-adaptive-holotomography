@@ -19,6 +19,19 @@ class CameraGuiClient(Protocol):
         """Acquire, verify, acknowledge, and detach one frame."""
 
 
+class LiveCameraGuiClient(Protocol):
+    """Latest-frame preview surface for the optional Qt camera viewer."""
+
+    def start(self) -> None:
+        """Connect and start one service-owned live sequence."""
+
+    def read_latest(self) -> LiveCameraFrame | None:
+        """Return the newest EPICS live frame, if it advanced."""
+
+    def stop(self) -> None:
+        """Stop live sequence acquisition and disconnect the service."""
+
+
 @dataclass(frozen=True, slots=True)
 class AcquiredCameraFrame:
     """Detached frame returned only after its service lease is acknowledged."""
@@ -29,6 +42,15 @@ class AcquiredCameraFrame:
     sequence: int
     timestamp_ns: int
     checksum: str
+    array: np.ndarray[Any, Any]
+
+
+@dataclass(frozen=True, slots=True)
+class LiveCameraFrame:
+    """Detached latest-wins frame received from the live EPICS image PV."""
+
+    sequence: int
+    timestamp_ns: int
     array: np.ndarray[Any, Any]
 
 
@@ -143,4 +165,127 @@ class EpicsCameraGuiClient:
         )
 
 
-__all__ = ["AcquiredCameraFrame", "CameraGuiClient", "EpicsCameraGuiClient"]
+class EpicsLiveCameraGuiClient:
+    """Poll the service-owned latest-frame EPICS preview contract.
+
+    The service, not this GUI client, drains MMCore's circular buffer. Reading
+    at the GUI refresh rate cannot trigger a camera exposure or slow the drain
+    task; missed preview sequences are expected latest-wins behavior.
+    """
+
+    def __init__(self, prefix: str, *, timeout: float = 15.0) -> None:
+        if not prefix.endswith(":"):
+            raise ValueError("camera service prefix must end with ':'")
+        if timeout <= 0:
+            raise ValueError("camera service timeout must be positive")
+        self.prefix = prefix
+        self.timeout = timeout
+        self._last_sequence = -1
+        self._connected = False
+
+    def start(self) -> None:
+        """Connect the service and start its continuous sequence once."""
+        try:
+            self._write("COMMAND:CONNECT", 1)
+            self._await("CONNECTION_STATE", "ready")
+            self._write("COMMAND:START_LIVE", 1)
+            self._await("LIVE_STATE", "running")
+            self._connected = True
+        except BaseException:
+            self._connected = False
+            raise
+
+    def read_latest(self) -> LiveCameraFrame | None:
+        """Read and detach the newest image if its sequence advanced."""
+        if not self._connected:
+            raise RuntimeError("camera live view is not started")
+        sequence = self._integer("LIVE_SEQUENCE")
+        if sequence < 0 or sequence == self._last_sequence:
+            return None
+        shape = tuple(int(item) for item in self._text("LIVE_SHAPE").split(","))
+        if len(shape) != 2 or any(item <= 0 for item in shape):
+            raise RuntimeError("camera IOC published an invalid live frame shape")
+        dtype = np.dtype(self._text("LIVE_DTYPE"))
+        byte_count = self._integer("LIVE_BYTE_COUNT")
+        expected_count = int(np.prod(shape, dtype=np.int64)) * dtype.itemsize
+        if byte_count != expected_count:
+            raise RuntimeError(
+                "camera IOC live frame byte count does not match metadata"
+            )
+        payload = self._bytes("LIVE_IMAGE")
+        if len(payload) < byte_count:
+            raise RuntimeError("camera IOC live image payload is shorter than metadata")
+        self._last_sequence = sequence
+        array = np.frombuffer(payload[:byte_count], dtype=dtype).reshape(shape).copy()
+        return LiveCameraFrame(
+            sequence=sequence,
+            timestamp_ns=self._integer("LIVE_TIMESTAMP_NS"),
+            array=array,
+        )
+
+    def stop(self) -> None:
+        """Stop the sequence and disconnect even when display polling failed."""
+        if not self._connected:
+            return
+        try:
+            self._write("COMMAND:STOP", 1)
+            self._await("LIVE_STATE", "idle")
+        finally:
+            try:
+                self._write("COMMAND:DISCONNECT", 1)
+            finally:
+                self._connected = False
+                self._last_sequence = -1
+
+    def _await(self, suffix: str, expected: object) -> None:
+        deadline = time.monotonic() + self.timeout
+        while time.monotonic() < deadline:
+            try:
+                value = self._read(suffix)
+                if isinstance(value, bytes):
+                    value = value.decode()
+                if value == expected:
+                    return
+            except Exception:
+                pass
+            time.sleep(0.02)
+        raise TimeoutError(f"{self.prefix}{suffix} did not become {expected!r}")
+
+    def _bytes(self, suffix: str) -> bytes:
+        value = read(
+            f"{self.prefix}{suffix}", timeout=0.5, repeater=False
+        ).data
+        if isinstance(value, bytes):
+            return value
+        if isinstance(value, str):
+            return value.encode("latin-1")
+        return np.asarray(value, dtype=np.uint8).tobytes()
+
+    def _text(self, suffix: str) -> str:
+        value = self._read(suffix)
+        return value.decode() if isinstance(value, bytes) else str(value)
+
+    def _integer(self, suffix: str) -> int:
+        return int(self._text(suffix))
+
+    def _read(self, suffix: str) -> object:
+        return read(f"{self.prefix}{suffix}", timeout=0.5, repeater=False).data[0]
+
+    def _write(self, suffix: str, value: int) -> None:
+        write(
+            f"{self.prefix}{suffix}",
+            value,
+            notify=True,
+            repeater=False,
+            timeout=self.timeout,
+        )
+
+
+__all__ = [
+    "AcquiredCameraFrame",
+    "CameraGuiClient",
+    "EpicsCameraGuiClient",
+    "EpicsLiveCameraGuiClient",
+    "LiveCameraFrame",
+    "LiveCameraGuiClient",
+]

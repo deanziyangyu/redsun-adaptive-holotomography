@@ -11,6 +11,8 @@ from redsun_aht.presenter.camera import (
     AcquiredCameraFrame,
     CameraGuiClient,
     EpicsCameraGuiClient,
+    EpicsLiveCameraGuiClient,
+    LiveCameraGuiClient,
 )
 
 
@@ -22,13 +24,18 @@ class CameraAcquisitionWidget(QtWidgets.QWidget):
         prefix: str,
         *,
         client: CameraGuiClient | None = None,
+        live_client: LiveCameraGuiClient | None = None,
         parent: QtWidgets.QWidget | None = None,
     ) -> None:
         super().__init__(parent)
         self.prefix = prefix
         self.client = client or EpicsCameraGuiClient(prefix)
+        self.live_client = live_client or EpicsLiveCameraGuiClient(prefix)
         self.last_capture: AcquiredCameraFrame | None = None
         self.last_frame: np.ndarray[Any, Any] | None = None
+        self._live_timer = QtCore.QTimer(self)
+        self._live_timer.setInterval(1000 // 60)
+        self._live_timer.timeout.connect(self._poll_live)
         self._build_ui()
 
     def _build_ui(self) -> None:
@@ -39,6 +46,13 @@ class CameraAcquisitionWidget(QtWidgets.QWidget):
         self.capture_button = QtWidgets.QPushButton("Capture one frame")
         self.capture_button.clicked.connect(self.capture_once)
         layout.addWidget(self.capture_button)
+        self.start_live_button = QtWidgets.QPushButton("Start live view")
+        self.start_live_button.clicked.connect(self.start_live)
+        layout.addWidget(self.start_live_button)
+        self.stop_live_button = QtWidgets.QPushButton("Stop live view")
+        self.stop_live_button.clicked.connect(self.stop_live)
+        self.stop_live_button.setEnabled(False)
+        layout.addWidget(self.stop_live_button)
         self.status_label = QtWidgets.QLabel("Idle")
         self.status_label.setWordWrap(True)
         layout.addWidget(self.status_label)
@@ -48,7 +62,7 @@ class CameraAcquisitionWidget(QtWidgets.QWidget):
         layout.addWidget(self.preview_label)
 
     def capture_once(self) -> None:
-        """Capture one frame, present its detached copy, and report integrity."""
+        """Capture one explicit snap, then present its detached verified copy."""
         self.capture_button.setEnabled(False)
         self.status_label.setText("Acquiring one frameâ€¦")
         try:
@@ -64,6 +78,63 @@ class CameraAcquisitionWidget(QtWidgets.QWidget):
             self.status_label.setText(f"Failed: {type(error).__name__}: {error}")
         finally:
             self.capture_button.setEnabled(True)
+
+    def start_live(self) -> None:
+        """Start one sequence-backed, latest-wins service live view."""
+        self.start_live_button.setEnabled(False)
+        self.status_label.setText("Starting sequence-backed live view…")
+        try:
+            self.live_client.start()
+            self.capture_button.setEnabled(False)
+            self.stop_live_button.setEnabled(True)
+            self._live_timer.start()
+            self.status_label.setText(
+                "Live view running (EPICS latest frame, max 60 Hz)"
+            )
+        except Exception as error:
+            self.status_label.setText(
+                f"Live view failed: {type(error).__name__}: {error}"
+            )
+            self.start_live_button.setEnabled(True)
+
+    def stop_live(self) -> None:
+        """Stop the live sequence and re-enable explicit single-frame capture."""
+        self._live_timer.stop()
+        try:
+            self.live_client.stop()
+            self.status_label.setText("Live view stopped")
+        except Exception as error:
+            self.status_label.setText(
+                f"Live stop failed: {type(error).__name__}: {error}"
+            )
+        finally:
+            self.capture_button.setEnabled(True)
+            self.start_live_button.setEnabled(True)
+            self.stop_live_button.setEnabled(False)
+
+    def _poll_live(self) -> None:
+        """Render at most one latest frame per GUI timer tick."""
+        try:
+            frame = self.live_client.read_latest()
+            if frame is None:
+                return
+            self.last_frame = frame.array
+            self._present(frame.array)
+            self.status_label.setText(f"Live sequence {frame.sequence}")
+        except Exception as error:
+            self._live_timer.stop()
+            self.capture_button.setEnabled(True)
+            self.start_live_button.setEnabled(True)
+            self.stop_live_button.setEnabled(False)
+            self.status_label.setText(
+                f"Live view failed: {type(error).__name__}: {error}"
+            )
+
+    def closeEvent(self, event: QtGui.QCloseEvent | None) -> None:
+        """Release the service-owned sequence when the optional viewer closes."""
+        if self._live_timer.isActive():
+            self.stop_live()
+        super().closeEvent(event)
 
     def _present(self, array: np.ndarray[Any, Any]) -> None:
         image = np.asarray(array)

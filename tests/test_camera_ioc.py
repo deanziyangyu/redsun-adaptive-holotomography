@@ -18,6 +18,7 @@ import pytest
 from caproto.sync.client import read, write
 
 from redsun_aht.device import CameraServiceDevice
+from redsun_aht.device.camera.profiles import PVCAM_FCS_PROPERTIES
 from redsun_aht.domain import ServiceConnectionState
 from redsun_aht.services import camera_ioc
 from redsun_aht.services.camera_ioc import build_camera_ioc
@@ -30,7 +31,7 @@ def test_two_camera_iocs_have_disjoint_control_planes() -> None:
     assert set(fluorescence.pvdb).isdisjoint(dhm.pvdb)
     assert "AHT:PVCAM:SIM:SERVICE_ID" in fluorescence.pvdb
     assert "AHT:FLIR:SIM:COMMAND:TRIGGER" in dhm.pvdb
-    assert len(fluorescence.pvdb) == len(dhm.pvdb) == 33
+    assert len(fluorescence.pvdb) == len(dhm.pvdb) == 46
 
 
 def test_camera_ioc_prefix_is_explicit() -> None:
@@ -99,6 +100,53 @@ def test_camera_ioc_entry_point_builds_without_hardware(
         == 0
     )
     assert "AHT:CLI:SERVICE_ID" in captured["pvdb"]
+
+
+def test_camera_ioc_cli_applies_verified_pvcam_fcs_profile(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from redsun_aht.device.camera import mmcore
+
+    captured: dict[str, Any] = {}
+
+    class RecordingBackend:
+        def __init__(self, profile: object) -> None:
+            captured["profile"] = profile
+
+        def disconnect(self) -> None:
+            pass
+
+    monkeypatch.setattr(mmcore, "MMCoreCameraBackend", RecordingBackend)
+    monkeypatch.setattr(camera_ioc, "run", lambda *args, **kwargs: None)
+    config_path = tmp_path / "pvcam_base.cfg"
+    config_path.write_text("# fake", encoding="utf-8")
+
+    assert (
+        camera_ioc.main(
+            [
+                "--service-id",
+                "pvcam-fcs",
+                "--prefix",
+                "AHT:PVCAM:FCS:",
+                "--backend",
+                "mmcore",
+                "--mm-path",
+                str(tmp_path),
+                "--mm-config",
+                str(config_path),
+                "--adapter",
+                "PVCAM",
+                "--device-name",
+                "Camera-1",
+                "--camera-label",
+                "Camera-1",
+                "--pvcam-fcs-profile",
+            ]
+        )
+        == 0
+    )
+    profile = captured["profile"]
+    assert profile.initial_properties == PVCAM_FCS_PROPERTIES
 
 
 def _start_ioc(
@@ -221,6 +269,63 @@ def _available_udp_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as candidate:
         candidate.bind(("127.0.0.1", 0))
         return int(candidate.getsockname()[1])
+
+
+def test_simulated_live_ioc_publishes_epics_latest_frame() -> None:
+    prefix = "AHT:TEST:LIVE:"
+    port = _available_udp_port()
+    os.environ["EPICS_CA_ADDR_LIST"] = f"127.0.0.1:{port}"
+    os.environ["EPICS_CA_AUTO_ADDR_LIST"] = "NO"
+    process = _start_ioc("live", prefix, port)
+    try:
+        _await_value(f"{prefix}SCHEMA_GENERATION", 1)
+        write(f"{prefix}COMMAND:CONNECT", 1, notify=True, repeater=False)
+        write(f"{prefix}COMMAND:START_LIVE", 1, notify=True, repeater=False)
+        _await_value(f"{prefix}LIVE_STATE", "running")
+        deadline = time.monotonic() + 3.0
+        while time.monotonic() < deadline:
+            if int(_read_value(f"{prefix}LIVE_FRAMES_PUBLISHED")) > 0:
+                break
+            time.sleep(0.02)
+        else:
+            raise TimeoutError("simulated live IOC did not publish a frame")
+        payload = read(f"{prefix}LIVE_IMAGE", timeout=0.5, repeater=False).data
+        byte_count = int(_read_value(f"{prefix}LIVE_BYTE_COUNT"))
+        assert byte_count == 12
+        assert len(np.asarray(payload).tobytes()) >= byte_count
+        assert int(_read_value(f"{prefix}LIVE_SEQUENCE")) >= 0
+        assert int(_read_value(f"{prefix}LIVE_FRAMES_DRAINED")) >= 1
+        write(f"{prefix}COMMAND:STOP", 1, notify=True, repeater=False)
+        _await_value(f"{prefix}LIVE_STATE", "idle")
+    finally:
+        _stop_ioc(process)
+
+
+def test_epics_live_gui_client_decodes_simulated_latest_frame() -> None:
+    from redsun_aht.presenter.camera import EpicsLiveCameraGuiClient
+
+    prefix = "AHT:TEST:LIVEGUI:"
+    port = _available_udp_port()
+    os.environ["EPICS_CA_ADDR_LIST"] = f"127.0.0.1:{port}"
+    os.environ["EPICS_CA_AUTO_ADDR_LIST"] = "NO"
+    process = _start_ioc("live-gui", prefix, port)
+    client = EpicsLiveCameraGuiClient(prefix, timeout=5)
+    try:
+        _await_value(f"{prefix}SCHEMA_GENERATION", 1)
+        client.start()
+        deadline = time.monotonic() + 3.0
+        frame = None
+        while time.monotonic() < deadline and frame is None:
+            frame = client.read_latest()
+            time.sleep(0.02)
+        assert frame is not None
+        assert frame.sequence >= 0
+        assert frame.array.shape == (2, 3)
+        assert frame.array.dtype == np.uint16
+        client.stop()
+        _await_value(f"{prefix}CONNECTION_STATE", "disconnected")
+    finally:
+        _stop_ioc(process)
 
 
 def test_two_live_iocs_command_independently_and_restart() -> None:

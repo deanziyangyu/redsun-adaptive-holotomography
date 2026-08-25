@@ -13,7 +13,7 @@ import pytest
 from caproto.sync.client import read, write
 
 from redsun_aht.configurations import run_processing_simulation
-from redsun_aht.presenter.camera import AcquiredCameraFrame
+from redsun_aht.presenter.camera import AcquiredCameraFrame, LiveCameraFrame
 from redsun_aht.storage import CameraCaptureZarrStore
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -34,6 +34,28 @@ class _Client:
             checksum="a" * 64,
             array=np.arange(12, dtype=np.uint16).reshape(3, 4),
         )
+
+
+class _LiveClient:
+    def __init__(self) -> None:
+        self.started = 0
+        self.stopped = 0
+        self.frames = [
+            LiveCameraFrame(
+                sequence=8,
+                timestamp_ns=456,
+                array=np.arange(12, dtype=np.uint16).reshape(3, 4),
+            )
+        ]
+
+    def start(self) -> None:
+        self.started += 1
+
+    def read_latest(self) -> LiveCameraFrame | None:
+        return self.frames.pop(0) if self.frames else None
+
+    def stop(self) -> None:
+        self.stopped += 1
 
 
 def test_camera_acquisition_widget_captures_one_detached_frame() -> None:
@@ -82,6 +104,39 @@ def test_camera_acquisition_widget_surfaces_capture_failure() -> None:
 
     assert application is not None
     assert widget.status_label.text() == "Failed: RuntimeError: camera unavailable"
+    assert widget.capture_button.isEnabled()
+    widget.close()
+
+
+def test_camera_acquisition_widget_uses_sequence_backed_live_client() -> None:
+    from qtpy import QtWidgets
+
+    from redsun_aht.view.camera import CameraAcquisitionWidget
+
+    application_instance = QtWidgets.QApplication.instance()
+    application = (
+        application_instance
+        if isinstance(application_instance, QtWidgets.QApplication)
+        else QtWidgets.QApplication([])
+    )
+    snap_client = _Client()
+    live_client = _LiveClient()
+    widget = CameraAcquisitionWidget(
+        "AHT:CAM:", client=snap_client, live_client=live_client
+    )
+
+    widget.start_live()
+    widget._poll_live()
+
+    assert application is not None
+    assert live_client.started == 1
+    assert snap_client.calls == 0
+    assert widget.last_frame is not None
+    assert widget.last_frame.shape == (3, 4)
+    assert widget.status_label.text() == "Live sequence 8"
+    assert not widget.capture_button.isEnabled()
+    widget.stop_live()
+    assert live_client.stopped == 1
     assert widget.capture_button.isEnabled()
     widget.close()
 

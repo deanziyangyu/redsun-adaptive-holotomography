@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 from multiprocessing import shared_memory
 from pathlib import Path
@@ -34,6 +35,13 @@ class FakeCore:
         self.loaded_config: str | None = None
         self.snap_count = 0
         self.stop_count = 0
+        self.clear_buffer_count = 0
+        self.initialize_buffer_count = 0
+        self.buffer_memory_mb: int | None = None
+        self.continuous_intervals: list[float] = []
+        self.finite_sequences: list[tuple[int, float, bool]] = []
+        self.sequence_frames: list[np.ndarray[Any, np.dtype[np.uint16]]] = []
+        self.buffer_overflowed = False
         self.unload_count = 0
         self.exposure_ms = 10.0
         self.roi = (0, 0, 3, 2)
@@ -121,6 +129,33 @@ class FakeCore:
     def setROI(self, x: int, y: int, width: int, height: int) -> None:
         self.roi = (x, y, width, height)
 
+    def clearCircularBuffer(self) -> None:
+        self.clear_buffer_count += 1
+        self.sequence_frames.clear()
+
+    def setCircularBufferMemoryFootprint(self, size_mb: int) -> None:
+        self.buffer_memory_mb = size_mb
+
+    def initializeCircularBuffer(self) -> None:
+        self.initialize_buffer_count += 1
+
+    def startSequenceAcquisition(
+        self, frame_count: int, interval_ms: float, stop_on_overflow: bool
+    ) -> None:
+        self.finite_sequences.append((frame_count, interval_ms, stop_on_overflow))
+
+    def startContinuousSequenceAcquisition(self, interval_ms: float) -> None:
+        self.continuous_intervals.append(interval_ms)
+
+    def getRemainingImageCount(self) -> int:
+        return len(self.sequence_frames)
+
+    def popNextImage(self) -> np.ndarray[Any, np.dtype[np.uint16]]:
+        return self.sequence_frames.pop(0)
+
+    def isBufferOverflowed(self) -> bool:
+        return self.buffer_overflowed
+
     def stopSequenceAcquisition(self) -> None:
         self.stop_count += 1
 
@@ -166,6 +201,54 @@ def test_backend_admits_one_camera_and_forces_auto_shutter_off(
     backend.disconnect()
     assert core.auto_shutter is False
     assert core.unload_count == 1
+
+
+def test_backend_keeps_single_snap_and_sequence_paths_separate(tmp_path: Path) -> None:
+    core = FakeCore()
+    backend = MMCoreCameraBackend(_profile(tmp_path), core_factory=lambda path: core)
+    backend.connect()
+
+    backend.arm()
+    np.testing.assert_array_equal(backend.trigger(), np.ones((2, 3), dtype=np.uint16))
+    backend.stop()
+    core.sequence_frames.extend(
+        (
+            np.full((2, 3), 4, dtype=np.uint16),
+            np.full((2, 3), 5, dtype=np.uint16),
+        )
+    )
+    backend.start_sequence(interval_ms=1.5, buffer_memory_mb=64)
+
+    assert core.snap_count == 1
+    assert core.clear_buffer_count == 1
+    assert core.initialize_buffer_count == 1
+    assert core.buffer_memory_mb == 64
+    assert core.continuous_intervals == [1.5]
+    assert backend.drain_sequence() == ()
+    core.sequence_frames.extend(
+        (
+            np.full((2, 3), 4, dtype=np.uint16),
+            np.full((2, 3), 5, dtype=np.uint16),
+        )
+    )
+    drained = backend.drain_sequence()
+    assert len(drained) == 2
+    np.testing.assert_array_equal(drained[-1], np.full((2, 3), 5, dtype=np.uint16))
+    core.buffer_overflowed = True
+    assert backend.sequence_overflowed()
+    with pytest.raises(RuntimeError, match="sequence acquisition"):
+        backend.trigger()
+
+
+def test_backend_uses_finite_sequence_api_for_list_scans(tmp_path: Path) -> None:
+    core = FakeCore()
+    backend = MMCoreCameraBackend(_profile(tmp_path), core_factory=lambda path: core)
+    backend.connect()
+
+    backend.start_sequence(frame_count=7, interval_ms=2.5, buffer_memory_mb=32)
+
+    assert core.finite_sequences == [(7, 2.5, True)]
+    assert core.continuous_intervals == []
 
 
 def test_backend_rejects_wrong_adapter_and_cleans_up(tmp_path: Path) -> None:
@@ -318,5 +401,46 @@ def test_ioc_delegates_lifecycle_to_mmcore_backend(tmp_path: Path) -> None:
             shared_memory.SharedMemory(name=memory_name)
 
     import asyncio
+
+    asyncio.run(scenario())
+
+
+def test_ioc_live_view_drains_sequence_without_single_snaps(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        core = FakeCore()
+        backend = MMCoreCameraBackend(
+            _profile(tmp_path), core_factory=lambda path: core
+        )
+        ioc = build_camera_ioc(
+            "fluorescence",
+            "AHT:PVCAM:LIVE:",
+            backend=backend,
+            live_publish_hz=60,
+        )
+
+        await ioc.command_connect.pvspec.put(ioc, ioc.command_connect, 1)
+        await ioc.command_start_live.pvspec.put(ioc, ioc.command_start_live, 1)
+        core.sequence_frames.extend(
+            (
+                np.full((2, 3), 4, dtype=np.uint16),
+                np.full((2, 3), 5, dtype=np.uint16),
+            )
+        )
+        await asyncio.sleep(0.04)
+
+        assert core.snap_count == 0
+        assert core.continuous_intervals == [0.0]
+        assert ioc.live_state.value == "running"
+        assert ioc.live_frames_drained.value == 2
+        assert ioc.live_frames_published.value == 1
+        assert ioc.live_frames_skipped.value == 1
+        assert ioc.live_sequence.value == 1
+        payload = str(ioc.live_image.value).encode("latin-1")
+        image = np.frombuffer(payload, dtype=np.dtype(str(ioc.live_dtype.value)))
+        np.testing.assert_array_equal(image.reshape(2, 3), np.full((2, 3), 5))
+
+        await ioc.command_stop.pvspec.put(ioc, ioc.command_stop, 1)
+        assert ioc.live_state.value == "idle"
+        assert ioc.acquisition_state.value == "idle"
 
     asyncio.run(scenario())

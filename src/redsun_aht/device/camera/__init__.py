@@ -8,9 +8,11 @@ from .mmcore import (
     MMCoreCameraProfile,
     MMCoreUnavailableError,
 )
+from .profiles import PVCAM_FCS_PROPERTIES
 from .service import CameraServiceDevice
 
 __all__ = [
+    "PVCAM_FCS_PROPERTIES",
     "CameraAdmissionError",
     "CameraIdentity",
     "CameraProperty",
