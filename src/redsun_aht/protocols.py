@@ -7,10 +7,15 @@ from typing import TYPE_CHECKING, Protocol, runtime_checkable
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Mapping, Sequence
 
+    from bluesky.protocols import Status
+    from event_model import PartialEvent
+
     from redsun_aht.domain import (
         CalibrationArtifact,
         DetectorCapabilities,
         Frame,
+        HardwareServiceStatus,
+        Observation,
         PoseSample,
         ProcessingJob,
     )
@@ -36,6 +41,20 @@ class Detector(Protocol):
     async def stop(self) -> None: ...
 
     async def disconnect(self) -> None: ...
+
+
+@runtime_checkable
+class SupervisedDetector(Detector, Protocol):
+    """Detector service surface used by discovery and reconnect supervision."""
+
+    @property
+    def service_id(self) -> str: ...
+
+    @property
+    def epics_prefix(self) -> str: ...
+
+    @property
+    def status(self) -> HardwareServiceStatus: ...
 
 
 @runtime_checkable
@@ -94,15 +113,17 @@ class SolverPlugin(Protocol):
 class ProcessingFlyer(Protocol):
     """Run-coupled lifecycle adapter; kernels execute in detached workers."""
 
-    async def prepare(self, job: ProcessingJob) -> None: ...
+    def prepare(self, job: ProcessingJob) -> Status: ...
 
-    async def kickoff(self) -> None: ...
+    def kickoff(self) -> Status: ...
 
-    async def complete(self) -> None: ...
+    async def accept(self, observation: Observation) -> None: ...
 
-    async def collect(self) -> AsyncIterator[Mapping[str, JsonValue]]: ...
+    def complete(self) -> Status: ...
 
-    async def stop(self) -> None: ...
+    def collect(self) -> AsyncIterator[PartialEvent]: ...
+
+    def stop(self) -> Status: ...
 
 
 __all__ = [
@@ -112,4 +133,5 @@ __all__ = [
     "ProcessingFlyer",
     "RemoteReconstructionProvider",
     "SolverPlugin",
+    "SupervisedDetector",
 ]

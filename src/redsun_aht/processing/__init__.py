@@ -1,1 +1,157 @@
-"""Detached processing jobs, states, and supervision (planned)."""
+"""Detached hardware-free processing contracts and worker supervision."""
+
+from .fixed_median import (
+    FixedMedian,
+    fixed_median_from_czyx,
+    fixed_median_from_czyx_store,
+)
+from .multilayer import (
+    BaseMultiLayerModel,
+    ForwardResult,
+    MultiLayerBornModel,
+    MultiLayerConfig,
+    MultiSliceModel,
+    create_multilayer_model,
+    ring_illumination_frequencies,
+)
+from .multilayer_iterative import (
+    MultiLayerSolveConfig,
+    MultiLayerSolveResult,
+    prox_tv_chambolle_3d,
+    solve_multilayer,
+)
+from .multilayer_job import (
+    MultiLayerProcessingPlan,
+    MultiLayerProcessingRequest,
+    MultiLayerReconstructionConfig,
+    resolve_multilayer_processing,
+    run_multilayer_processing_plan,
+)
+from .offline import (
+    OfflineMultiLayerJobRequest,
+    OfflineProcessingPlan,
+    OfflineProcessingRequest,
+    OfflineTiledJobRequest,
+    read_processing_result_array,
+    resolve_offline_processing,
+    run_offline_processing_plan,
+)
+from .quantitative import (
+    CupyQuantitativeRuntime,
+    CupyQuantitativeTileSolver,
+    NumpyQuantitativeTileSolver,
+    QuantitativeTileConfig,
+)
+from .replay import (
+    observations_from_camera_capture_bundle,
+    observations_from_dpct_bundle,
+    observations_from_offline_bundle,
+    read_observation_array,
+)
+from .resources import (
+    GpuAdmissionError,
+    GpuDeviceInfo,
+    GpuDiscoveryError,
+    GpuLease,
+    GpuResourcePool,
+    GpuResourceRequest,
+    discover_nvidia_gpus,
+)
+from .solvers import (
+    GpuMeanProjectionSolver,
+    MeanProjectionSolver,
+    ProcessingCancelled,
+    QualityMetricsSolver,
+    SolverKernel,
+)
+from .supervisor import (
+    ProcessingBatchResult,
+    ProcessingSupervisor,
+    SolverWorker,
+    WorkerJobError,
+    WorkerUnavailableError,
+)
+from .tiled_job import (
+    TiledProcessingPlan,
+    TiledProcessingRequest,
+    resolve_tiled_processing,
+    run_tiled_processing_plan,
+)
+from .tiling import (
+    DEFAULT_VOXEL_BUDGET,
+    TiledReconstructionResult,
+    TiledVolumeReconstructor,
+    TilePlacement,
+    TilePlan,
+    TileSolver,
+    TilingConfig,
+    resolve_tile_plan,
+    tile_weight,
+)
+
+__all__ = [
+    "DEFAULT_VOXEL_BUDGET",
+    "BaseMultiLayerModel",
+    "CupyQuantitativeRuntime",
+    "CupyQuantitativeTileSolver",
+    "FixedMedian",
+    "ForwardResult",
+    "GpuAdmissionError",
+    "GpuDeviceInfo",
+    "GpuDiscoveryError",
+    "GpuLease",
+    "GpuMeanProjectionSolver",
+    "GpuResourcePool",
+    "GpuResourceRequest",
+    "MeanProjectionSolver",
+    "MultiLayerBornModel",
+    "MultiLayerConfig",
+    "MultiLayerProcessingPlan",
+    "MultiLayerProcessingRequest",
+    "MultiLayerReconstructionConfig",
+    "MultiLayerSolveConfig",
+    "MultiLayerSolveResult",
+    "MultiSliceModel",
+    "NumpyQuantitativeTileSolver",
+    "OfflineMultiLayerJobRequest",
+    "OfflineProcessingPlan",
+    "OfflineProcessingRequest",
+    "OfflineTiledJobRequest",
+    "ProcessingBatchResult",
+    "ProcessingCancelled",
+    "ProcessingSupervisor",
+    "QualityMetricsSolver",
+    "QuantitativeTileConfig",
+    "SolverKernel",
+    "SolverWorker",
+    "TilePlacement",
+    "TilePlan",
+    "TileSolver",
+    "TiledProcessingPlan",
+    "TiledProcessingRequest",
+    "TiledReconstructionResult",
+    "TiledVolumeReconstructor",
+    "TilingConfig",
+    "WorkerJobError",
+    "WorkerUnavailableError",
+    "create_multilayer_model",
+    "discover_nvidia_gpus",
+    "fixed_median_from_czyx",
+    "fixed_median_from_czyx_store",
+    "observations_from_camera_capture_bundle",
+    "observations_from_dpct_bundle",
+    "observations_from_offline_bundle",
+    "prox_tv_chambolle_3d",
+    "read_observation_array",
+    "read_processing_result_array",
+    "resolve_multilayer_processing",
+    "resolve_offline_processing",
+    "resolve_tile_plan",
+    "resolve_tiled_processing",
+    "ring_illumination_frequencies",
+    "run_multilayer_processing_plan",
+    "run_offline_processing_plan",
+    "run_tiled_processing_plan",
+    "solve_multilayer",
+    "tile_weight",
+]

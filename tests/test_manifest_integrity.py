@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from importlib import import_module
 from importlib.metadata import entry_points
 from importlib.resources import files
 
@@ -10,7 +11,19 @@ def test_redsun_manifest_has_only_supported_sections() -> None:
     manifest_path = files("redsun_aht").joinpath("redsun.yaml")
     manifest = yaml.safe_load(manifest_path.read_text(encoding="utf-8"))
 
-    assert manifest == {"devices": {}, "presenters": {}, "views": {}}
+    assert manifest == {
+        "devices": {},
+        "presenters": {
+            "simulation-lifecycle": (
+                "redsun_aht.presenter:SimulationLifecyclePresenter"
+            )
+        },
+        "views": {},
+    }
+    for group in ("devices", "presenters", "views"):
+        for class_path in manifest[group].values():
+            module_name, attribute = class_path.split(":", maxsplit=1)
+            assert getattr(import_module(module_name), attribute) is not None
 
 
 def test_redsun_entry_point_resolves_package_manifest() -> None:

@@ -1,3 +1,4 @@
 devices: {}
-presenters: {}
+presenters:
+  simulation-lifecycle: redsun_aht.presenter:SimulationLifecyclePresenter
 views: {}

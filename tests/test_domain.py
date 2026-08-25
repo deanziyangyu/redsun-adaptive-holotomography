@@ -4,7 +4,14 @@ from typing import Any, cast
 
 import pytest
 
-from redsun_aht.domain import DetectorCapabilities, PoseSample, RunEvent, RunEventKind
+from redsun_aht.domain import (
+    BufferUsage,
+    DetectorCapabilities,
+    FrameBufferDescriptor,
+    PoseSample,
+    RunEvent,
+    RunEventKind,
+)
 
 
 def test_detector_capabilities_reject_invalid_exposure_range() -> None:
@@ -40,3 +47,23 @@ def test_run_event_recursively_copies_and_freezes_detail() -> None:
     assert nested["values"] == (1, 2)
     with pytest.raises(TypeError):
         cast(Any, event.detail)["new"] = "value"
+
+
+def test_frame_buffer_descriptor_rejects_invalid_transport_metadata() -> None:
+    with pytest.raises(ValueError, match="positive"):
+        FrameBufferDescriptor(
+            service_id="camera",
+            run_id="run",
+            frame_id="frame",
+            sequence=0,
+            generation=0,
+            shared_memory_name="memory",
+            slot=0,
+            shape=(0, 2),
+            dtype="uint16",
+            byte_order="=",
+            timestamp_ns=0,
+            checksum="checksum",
+            usage=BufferUsage.PREVIEW,
+            lease_timeout_ns=1,
+        )

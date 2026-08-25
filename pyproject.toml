@@ -23,9 +23,18 @@ classifiers = [
   "Topic :: Scientific/Engineering",
 ]
 dependencies = [
+  "aioca==2.1",
+  "bluesky>=1.15,<2",
+  "caproto==1.3.0",
   "dependency-injector>=4.48,<5",
+  "event-model>=1.24,<2",
   "msgspec>=0.21.1,<0.22",
+  "numpy>=2,<3",
+  "opencv-python-headless==4.14.0.94",
+  "ophyd-async==0.21.1",
+  "psygnal>=0.15,<0.16",
   "redsun[zarr]==0.11.0",
+  "zarr==3.3.0",
 ]
 
 [dependency-groups]
@@ -39,6 +48,20 @@ dev = [
 ]
 
 [project.optional-dependencies]
+camera-mmcore = [
+  "pymmcore==12.5.0.75.0",
+  "pymmcore-plus==0.18.1",
+]
+stage-esp300 = [
+  "pyserial==3.5",
+]
+gpu-cupy = [
+  "cupy-cuda12x==14.2.0",
+]
+catalog-tiled = [
+  "bluesky-tiled-plugins==2.0.7",
+  "tiled[server]==0.2.14",
+]
 pyqt = [
   "napari[pyqt6]>=0.6.6",
   "redsun[pyqt]==0.11.0",
@@ -50,6 +73,7 @@ pyside = [
 
 [project.scripts]
 aht = "redsun_aht.__main__:main"
+aht-camera-ioc = "redsun_aht.services.camera_ioc:main"
 
 [project.entry-points."redsun.plugins"]
 redsun-aht = "redsun.yaml"
@@ -62,6 +86,7 @@ packages = ["src/redsun_aht"]
 
 [tool.coverage.run]
 branch = true
+patch = ["subprocess"]
 source = ["redsun_aht"]
 omit = ["src/redsun_aht/protocols.py"]
 
@@ -90,6 +115,7 @@ minversion = "9.0"
 addopts = "--strict-config --strict-markers"
 testpaths = ["tests"]
 markers = [
+  "catalog: requires the optional local Tiled catalog runtime",
   "hardware: requires explicitly enabled physical hardware",
 ]
 

@@ -1,0 +1,280 @@
+"""Deterministic offline iterative optimization for multi-layer IDT models."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any, Literal
+
+import numpy as np
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
+
+    from redsun_aht.processing.multilayer import (
+        BaseMultiLayerModel,
+        MeasurementDomain,
+    )
+
+OptimizerName = Literal["fista", "gradient_descent"]
+PupilUpdateMethod = Literal["gradient", "gauss_newton"]
+
+
+def _to_numpy(value: Any) -> np.ndarray[Any, Any]:
+    if hasattr(value, "get"):
+        return np.asarray(value.get())
+    return np.asarray(value)
+
+
+@dataclass(frozen=True, slots=True)
+class MultiLayerSolveConfig:
+    """Frozen iterative, regularization, and optional pupil-recovery inputs."""
+
+    max_iterations: int = 5
+    step_size: float | None = None
+    optimizer: OptimizerName = "fista"
+    restart_on_loss_increase: bool = True
+    random_order: bool = False
+    seed: int = 0
+    measurement_domain: MeasurementDomain = "intensity"
+    l2_weight: float = 0.0
+    tv_weight: float = 0.0
+    tv_iterations: int = 15
+    enforce_physical_sign: bool = True
+    recover_pupil: bool = False
+    pupil_step_size: float = 0.0
+    pupil_update_method: PupilUpdateMethod = "gradient"
+
+    def __post_init__(self) -> None:
+        """Reject non-deterministic or numerically invalid solver inputs."""
+        if type(self.max_iterations) is not int or self.max_iterations <= 0:
+            raise ValueError("multi-layer iterations must be a positive integer")
+        if self.step_size is not None and (
+            not np.isfinite(self.step_size) or self.step_size <= 0
+        ):
+            raise ValueError("multi-layer step size must be finite and positive")
+        if self.optimizer not in {"fista", "gradient_descent"}:
+            raise ValueError("multi-layer optimizer is unsupported")
+        if type(self.seed) is not int:
+            raise ValueError("multi-layer random seed must be an integer")
+        if self.measurement_domain not in {"intensity", "amplitude", "field"}:
+            raise ValueError("multi-layer measurement domain is unsupported")
+        if any(
+            not np.isfinite(value) or value < 0
+            for value in (self.l2_weight, self.tv_weight)
+        ):
+            raise ValueError("multi-layer regularization weights must be non-negative")
+        if type(self.tv_iterations) is not int or self.tv_iterations <= 0:
+            raise ValueError("multi-layer TV iterations must be a positive integer")
+        if not np.isfinite(self.pupil_step_size) or self.pupil_step_size < 0:
+            raise ValueError("multi-layer pupil step size cannot be negative")
+        if self.recover_pupil and self.pupil_step_size <= 0:
+            raise ValueError("pupil recovery requires a positive pupil step size")
+        if self.pupil_update_method not in {"gradient", "gauss_newton"}:
+            raise ValueError("multi-layer pupil update method is unsupported")
+
+
+@dataclass(frozen=True, slots=True)
+class MultiLayerSolveResult:
+    """Recovered RI, pupil, and immutable optimization history."""
+
+    refractive_index_zyx: Any
+    pupil_yx: Any
+    loss_history: tuple[float, ...]
+    step_history: tuple[float, ...]
+    restart_history: tuple[bool, ...]
+    phase_change_per_slice: float
+
+
+def prox_tv_chambolle_3d(
+    image: Any,
+    weight: float,
+    *,
+    max_iterations: int,
+    xp: Any,
+    check_cancelled: Callable[[], None],
+    epsilon: float = 2e-4,
+) -> Any:
+    """Apply the donor's backend-neutral isotropic 3-D TV proximal operator."""
+    if weight <= 0:
+        return image
+    if image.ndim != 3:
+        raise ValueError("multi-layer TV input must have ZYX axes")
+    p_value = xp.zeros((3, *image.shape), dtype=image.dtype)
+    gradient = xp.zeros_like(p_value)
+    divergence = xp.zeros_like(image)
+    output = image
+    initial_energy: float | None = None
+    previous_energy: float | None = None
+    tau = 1.0 / 6.0
+    for iteration in range(max_iterations):
+        check_cancelled()
+        if iteration:
+            divergence = -p_value.sum(axis=0)
+            for axis in range(3):
+                destination = [slice(None)] * 3
+                source: list[int | slice] = [slice(None)] * 4
+                destination[axis] = slice(1, None)
+                source[0] = axis
+                source[axis + 1] = slice(0, -1)
+                divergence[tuple(destination)] += p_value[tuple(source)]
+            output = image + divergence
+        energy = xp.sum(divergence * divergence)
+        gradient.fill(0)
+        for axis in range(3):
+            gradient_destination: list[int | slice] = [slice(None)] * 4
+            gradient_destination[0] = axis
+            gradient_destination[axis + 1] = slice(0, -1)
+            gradient[tuple(gradient_destination)] = xp.diff(output, axis=axis)
+        norm = xp.sqrt(xp.sum(gradient * gradient, axis=0))[None, ...]
+        energy += weight * xp.sum(norm)
+        p_value -= tau * gradient
+        p_value /= 1.0 + (tau / weight) * norm
+        scalar_energy = float((energy / image.size).item())
+        if initial_energy is None:
+            initial_energy = max(abs(scalar_energy), 1e-12)
+        elif previous_energy is not None and (
+            abs(previous_energy - scalar_energy) < epsilon * initial_energy
+        ):
+            break
+        previous_energy = scalar_energy
+    return output
+
+
+def solve_multilayer(
+    model: BaseMultiLayerModel,
+    measurements_syx: Any,
+    illumination_fxy: Any,
+    config: MultiLayerSolveConfig,
+    *,
+    check_cancelled: Callable[[], None] = lambda: None,
+) -> MultiLayerSolveResult:
+    """Run deterministic sequential-shot gradient or FISTA reconstruction."""
+    xp = model.xp
+    measurements = xp.asarray(measurements_syx)
+    frequencies = np.asarray(illumination_fxy, dtype=np.float64)
+    shots = int(measurements.shape[0]) if measurements.ndim == 3 else 0
+    if (
+        measurements.ndim != 3
+        or shots <= 0
+        or measurements.shape[1:] != model.shape_zyx[-2:]
+    ):
+        raise ValueError("multi-layer measurements must have SYX axes")
+    if frequencies.shape != (shots, 2) or not np.all(np.isfinite(frequencies)):
+        raise ValueError("multi-layer illuminations must have finite S,2 shape")
+    if not np.all(np.isfinite(_to_numpy(measurements))):
+        raise ValueError("multi-layer measurements must be finite")
+    domain: MeasurementDomain = config.measurement_domain
+    if domain == "intensity":
+        if bool(xp.any(measurements < 0).item()):
+            raise ValueError("multi-layer intensity cannot be negative")
+        measurements = xp.sqrt(xp.maximum(measurements, 0)).astype(xp.float32)
+        domain = "amplitude"
+    elif domain == "amplitude":
+        if bool(xp.any(measurements < 0).item()):
+            raise ValueError("multi-layer amplitude cannot be negative")
+        measurements = measurements.astype(xp.float32)
+    else:
+        measurements = measurements.astype(xp.complex64)
+
+    ri = xp.full(model.shape_zyx, model.n0, dtype=xp.float32)
+    native = model.ri_to_native(ri).astype(xp.float32)
+    step_size = config.step_size
+    if step_size is None:
+        step_size = 10.0 if model.model_name == "multi_born" else 2e-4
+    model.reset_pupil()
+    random = np.random.default_rng(config.seed)
+    momentum_reference = native.copy()
+    accepted_native = native.copy()
+    accepted_pupil = model.pupil.copy()
+    t_value = 1.0
+    previous_cost: float | None = None
+    losses: list[float] = []
+    restarts: list[bool] = []
+
+    for _iteration in range(config.max_iterations):
+        check_cancelled()
+        order = random.permutation(shots) if config.random_order else np.arange(shots)
+        total_cost = 0.0
+        pupil_gradient = xp.zeros_like(model.pupil)
+        pupil_hessian = xp.zeros_like(model.pupil.real)
+        for shot in order:
+            check_cancelled()
+            fx_value, fy_value = frequencies[int(shot)]
+            cost, gradient, shot_pupil_gradient, shot_pupil_hessian, _ = (
+                model.loss_and_gradient(
+                    native,
+                    measurements[int(shot)],
+                    fx_value,
+                    fy_value,
+                    measurement_domain=domain,
+                )
+            )
+            total_cost += cost
+            native -= step_size * gradient
+            if config.recover_pupil:
+                pupil_gradient += shot_pupil_gradient
+                pupil_hessian += shot_pupil_hessian
+        if config.l2_weight:
+            native -= step_size * config.l2_weight * native
+        if config.tv_weight:
+            native = prox_tv_chambolle_3d(
+                native,
+                config.tv_weight,
+                max_iterations=config.tv_iterations,
+                xp=xp,
+                check_cancelled=check_cancelled,
+            )
+        if config.enforce_physical_sign:
+            native = model.project_native(native)
+        if config.recover_pupil:
+            model.update_pupil(
+                pupil_gradient,
+                hessian=pupil_hessian,
+                step_size=config.pupil_step_size,
+                method=config.pupil_update_method,
+            )
+
+        restarted = False
+        if (
+            previous_cost is not None
+            and total_cost > previous_cost
+            and config.restart_on_loss_increase
+        ):
+            native = accepted_native.copy()
+            model.pupil_yx = accepted_pupil.copy()
+            momentum_reference = accepted_native.copy()
+            t_value = 1.0
+            restarted = True
+        else:
+            proximal_native = native.copy()
+            accepted_native = proximal_native.copy()
+            accepted_pupil = model.pupil.copy()
+            previous_cost = total_cost
+            if config.optimizer == "fista":
+                t_next = 0.5 * (1.0 + np.sqrt(1.0 + 4.0 * t_value**2))
+                beta = (t_value - 1.0) / t_next
+                native = proximal_native + beta * (proximal_native - momentum_reference)
+                momentum_reference = proximal_native
+                t_value = t_next
+        losses.append(float(total_cost))
+        restarts.append(restarted)
+
+    refractive_index = model.native_to_ri(accepted_native).astype(xp.float32)
+    return MultiLayerSolveResult(
+        refractive_index,
+        model.pupil.copy(),
+        tuple(losses),
+        tuple(float(step_size) for _ in losses),
+        tuple(restarts),
+        model.phase_change_per_slice(refractive_index),
+    )
+
+
+__all__ = [
+    "MultiLayerSolveConfig",
+    "MultiLayerSolveResult",
+    "OptimizerName",
+    "PupilUpdateMethod",
+    "prox_tv_chambolle_3d",
+    "solve_multilayer",
+]
