@@ -4,16 +4,16 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-import time
 from dataclasses import dataclass, field
 from multiprocessing import shared_memory
 from threading import Lock
 from typing import TYPE_CHECKING, Any, Literal, cast
 
 import numpy as np
-from caproto.threading.client import Context
+from ophyd_async.core import wait_for_value
 
-from redsun_aht.domain import ArrayReference, Frame
+from redsun_aht.device.camera import CameraServiceDevice
+from redsun_aht.domain import ArrayReference, Frame, ServiceConnectionState
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
@@ -25,14 +25,12 @@ if TYPE_CHECKING:
 
 @dataclass(slots=True)
 class EpicsCameraDetector:
-    """Adapt one camera IOC to the lossless detector contract used by DPCT.
+    """Adapt a camera IOC through the RedSun ophyd-async device contract.
 
-    The IOC owns the camera SDK and shared-memory slots.  This client only
-    commands the documented EPICS control plane, copies a committed slot, and
-    acknowledges it after its caller has durably retained the payload.
-    Camera settings are deliberately not accepted here: the current IOC has no
-    typed configuration command, so a recipe must use its admitted camera
-    configuration rather than silently ignoring requested settings.
+    Caproto remains the isolated IOC implementation. Application-side
+    acquisition uses :class:`CameraServiceDevice` for all control-plane
+    commands and descriptor reads; this adapter owns only the AHT-specific
+    shared-memory copy and checksum boundary.
     """
 
     service_id: str
@@ -40,12 +38,11 @@ class EpicsCameraDetector:
     timeout: float = 15.0
     poll_interval: float = 0.005
     _connected: bool = field(default=False, init=False, repr=False)
+    _device: CameraServiceDevice | None = field(default=None, init=False, repr=False)
     _latest_frame: Frame | None = field(default=None, init=False, repr=False)
     _latest_memory_name: str | None = field(default=None, init=False, repr=False)
     _latest_slot: int | None = field(default=None, init=False, repr=False)
-    _lock: Lock = field(default_factory=Lock, init=False, repr=False)
-    _context: Context | None = field(default=None, init=False, repr=False)
-    _pvs: dict[str, Any] = field(default_factory=dict, init=False, repr=False)
+    _copy_lock: Lock = field(default_factory=Lock, init=False, repr=False)
 
     def __post_init__(self) -> None:
         """Reject an incomplete IOC endpoint before a hardware command."""
@@ -60,7 +57,28 @@ class EpicsCameraDetector:
 
     async def connect(self) -> None:
         """Connect and verify that the service ID matches this composition."""
-        await asyncio.to_thread(self._connect)
+        if self._connected:
+            return
+        device = CameraServiceDevice(self.prefix, name=f"{self.service_id}_service")
+        self._device = device
+        try:
+            await device.connect(timeout=self.timeout)
+            await device.request_connect()
+            await self._await_ready(device)
+            status = await device.health()
+            if status.service_id != self.service_id:
+                await device.shutdown()
+                raise RuntimeError(
+                    f"camera IOC service ID {status.service_id!r} does not match "
+                    f"{self.service_id!r}"
+                )
+            if status.connection_state is not ServiceConnectionState.READY:
+                raise RuntimeError("camera IOC did not enter its ready state")
+            self._connected = True
+        except BaseException:
+            self._connected = False
+            self._device = None
+            raise
 
     async def configure(self, settings: Mapping[str, JsonValue]) -> str:
         """Reject settings the current camera IOC cannot apply faithfully."""
@@ -73,11 +91,87 @@ class EpicsCameraDetector:
 
     async def arm(self) -> None:
         """Arm one already admitted camera service."""
-        await asyncio.to_thread(self._arm)
+        device = self._require_device()
+        await device.arm()
+        await wait_for_value(device.acquisition_state, "armed", timeout=self.timeout)
 
     async def trigger(self) -> None:
         """Trigger exactly one frame and retain its immutable descriptor."""
-        await asyncio.to_thread(self._trigger)
+        device = self._require_device()
+        published = await device.frames_published.get_value()
+        await device.trigger()
+        await wait_for_value(
+            device.frames_published,
+            lambda value: value >= published + 1,
+            timeout=self.timeout,
+        )
+        (
+            generation,
+            sequence,
+            slot,
+            memory_name,
+            run_id,
+            frame_id,
+            shape_text,
+            dtype,
+            byte_order,
+            timestamp_ns,
+            checksum_hi,
+            checksum_lo,
+        ) = await self._await_descriptor(device)
+        generation = int(generation)
+        sequence = int(sequence)
+        slot = int(slot)
+        memory_name = str(memory_name)
+        run_id = str(run_id)
+        frame_id = str(frame_id)
+        shape_text = str(shape_text)
+        dtype = str(dtype)
+        byte_order = str(byte_order)
+        timestamp_ns = int(timestamp_ns)
+        checksum_hi = str(checksum_hi)
+        checksum_lo = str(checksum_lo)
+        if sequence < 0:
+            raise RuntimeError("camera IOC published an invalid frame sequence")
+        shape = tuple(int(item) for item in shape_text.split(","))
+        if not shape or any(item <= 0 for item in shape):
+            raise RuntimeError("camera IOC published an invalid frame shape")
+        if byte_order not in {"=", "<", ">", "|"}:
+            raise RuntimeError("camera IOC published an invalid byte order")
+        try:
+            np.dtype(dtype)
+        except TypeError as error:
+            raise RuntimeError("camera IOC published an invalid dtype") from error
+        checksum = checksum_hi + checksum_lo
+        if not all((memory_name, frame_id, run_id)) or len(checksum) != 64:
+            raise RuntimeError("camera IOC published an incomplete frame descriptor")
+        if timestamp_ns < 0:
+            raise RuntimeError("camera IOC published an invalid frame timestamp")
+        if slot < 0:
+            raise RuntimeError("camera IOC published an invalid frame slot")
+        self._latest_frame = Frame(
+            run_id=run_id,
+            frame_id=frame_id,
+            detector_id=self.service_id,
+            channel_id=self.service_id,
+            sequence=sequence,
+            exposure_started_ns=timestamp_ns,
+            exposure_ended_ns=timestamp_ns,
+            array=ArrayReference(
+                uri=(
+                    f"shm://{memory_name}?generation={generation}&slot={slot}"
+                    f"&sequence={sequence}"
+                ),
+                checksum=checksum,
+                shape=shape,
+                dtype=dtype,
+                byte_order=byte_order,
+            ),
+            configuration_revision="camera-ioc-fixed-configuration-v1",
+            quality_flags=frozenset({"exposure-window-unavailable"}),
+        )
+        self._latest_memory_name = memory_name
+        self._latest_slot = slot
 
     async def read(self) -> Frame:
         """Return metadata for the most recently committed frame."""
@@ -90,121 +184,45 @@ class EpicsCameraDetector:
         return await asyncio.to_thread(self._copy, sequence)
 
     async def acknowledge(self, sequence: int) -> None:
-        """Release precisely the frame slot that was copied by the caller."""
-        await asyncio.to_thread(self._acknowledge, sequence)
+        """Release precisely the frame slot copied by the caller."""
+        self._require_latest(sequence)
+        device = self._require_device()
+        await device.acknowledge(sequence)
+        await wait_for_value(
+            device.command_state, "frame_acknowledged", timeout=self.timeout
+        )
+        self._latest_frame = None
+        self._latest_memory_name = None
+        self._latest_slot = None
 
     async def stop(self) -> None:
         """Return ordinary camera acquisition to idle."""
-        await asyncio.to_thread(self._stop)
+        if self._connected:
+            device = self._require_device()
+            await device.stop()
+            await wait_for_value(device.acquisition_state, "idle", timeout=self.timeout)
 
     async def disconnect(self) -> None:
         """Release the isolated camera service and invalidate local metadata."""
-        await asyncio.to_thread(self._disconnect)
-
-    def _connect(self) -> None:
-        with self._lock:
-            if self._connected:
-                return
-            self._open_client()
-            try:
-                self._write("COMMAND:CONNECT", 1)
-                self._await("CONNECTION_STATE", "ready")
-                observed = self._text("SERVICE_ID")
-                if observed == self.service_id:
-                    self._connected = True
-                    return
-                try:
-                    self._write("COMMAND:DISCONNECT", 1)
-                finally:
-                    self._connected = False
-                raise RuntimeError(
-                    f"camera IOC service ID {observed!r} does not match "
-                    f"{self.service_id!r}"
-                )
-            except BaseException:
-                self._close_client()
-                raise
-
-    def _arm(self) -> None:
-        with self._lock:
-            self._require_connected()
-            self._write("COMMAND:ARM", 1)
-            self._await("ACQUISITION_STATE", "armed")
-
-    def _trigger(self) -> None:
-        with self._lock:
-            self._require_connected()
-            published = self._integer("FRAMES_PUBLISHED")
-            self._write("COMMAND:TRIGGER", 1)
-            self._await("FRAMES_PUBLISHED", published + 1)
-            sequence = self._integer("DESCRIPTOR_SEQUENCE")
-            if sequence < 0:
-                raise RuntimeError("camera IOC published an invalid frame sequence")
-            shape = tuple(
-                int(item) for item in self._text("DESCRIPTOR_SHAPE").split(",")
-            )
-            if not shape or any(item <= 0 for item in shape):
-                raise RuntimeError("camera IOC published an invalid frame shape")
-            dtype = self._text("DESCRIPTOR_DTYPE")
-            byte_order = self._text("DESCRIPTOR_BYTE_ORDER")
-            if byte_order not in {"=", "<", ">", "|"}:
-                raise RuntimeError("camera IOC published an invalid byte order")
-            try:
-                np.dtype(dtype)
-            except TypeError as error:
-                raise RuntimeError("camera IOC published an invalid dtype") from error
-            memory_name = self._text("DESCRIPTOR_NAME")
-            frame_id = self._text("DESCRIPTOR_FRAME_ID")
-            run_id = self._text("DESCRIPTOR_RUN_ID")
-            checksum = self._text("DESCRIPTOR_CHECKSUM_HI") + self._text(
-                "DESCRIPTOR_CHECKSUM_LO"
-            )
-            if not all((memory_name, frame_id, run_id)) or len(checksum) != 64:
-                raise RuntimeError(
-                    "camera IOC published an incomplete frame descriptor"
-                )
-            timestamp_ns = self._integer("DESCRIPTOR_TIMESTAMP_NS")
-            if timestamp_ns < 0:
-                raise RuntimeError("camera IOC published an invalid frame timestamp")
-            slot = self._integer("DESCRIPTOR_SLOT")
-            if slot < 0:
-                raise RuntimeError("camera IOC published an invalid frame slot")
-            generation = self._integer("DESCRIPTOR_GENERATION")
-            self._latest_frame = Frame(
-                run_id=run_id,
-                frame_id=frame_id,
-                detector_id=self.service_id,
-                channel_id=self.service_id,
-                sequence=sequence,
-                # The IOC publishes the committed-frame timestamp, not the
-                # camera's exposure interval. Keep that limitation explicit.
-                exposure_started_ns=timestamp_ns,
-                exposure_ended_ns=timestamp_ns,
-                array=ArrayReference(
-                    uri=(
-                        f"shm://{memory_name}?generation={generation}&slot={slot}"
-                        f"&sequence={sequence}"
-                    ),
-                    checksum=checksum,
-                    shape=shape,
-                    dtype=dtype,
-                    byte_order=byte_order,
-                ),
-                configuration_revision="camera-ioc-fixed-configuration-v1",
-                quality_flags=frozenset({"exposure-window-unavailable"}),
-            )
-            self._latest_memory_name = memory_name
-            self._latest_slot = slot
+        device, self._device = self._device, None
+        try:
+            if device is not None:
+                await device.shutdown()
+        finally:
+            self._connected = False
+            self._latest_frame = None
+            self._latest_memory_name = None
+            self._latest_slot = None
 
     def _copy(self, sequence: int) -> npt.NDArray[Any]:
-        with self._lock:
+        with self._copy_lock:
             frame = self._require_latest(sequence)
             memory_name = self._latest_memory_name
             slot = self._latest_slot
             if memory_name is None or slot is None:  # pragma: no cover - invariant
                 raise RuntimeError("camera IOC frame slot metadata is unavailable")
             byte_order = cast(
-                Literal["=", "<", ">", "|"],  # noqa: TC006 - NumPy needs Literal.
+                "Literal['=', '<', '>', '|']",
                 frame.array.byte_order,
             )
             dtype = np.dtype(frame.array.dtype).newbyteorder(byte_order)
@@ -226,120 +244,65 @@ class EpicsCameraDetector:
                 raise ValueError("camera shared-memory frame checksum mismatch")
             return copied
 
-    def _acknowledge(self, sequence: int) -> None:
-        with self._lock:
-            self._require_latest(sequence)
-            self._write("COMMAND:ACKNOWLEDGE", sequence)
-            self._await("COMMAND_STATE", "frame_acknowledged")
-
-    def _stop(self) -> None:
-        with self._lock:
-            if self._connected:
-                self._write("COMMAND:STOP", 1)
-                self._await("ACQUISITION_STATE", "idle")
-
-    def _disconnect(self) -> None:
-        with self._lock:
-            try:
-                if self._connected:
-                    self._write("COMMAND:DISCONNECT", 1)
-                    self._await("CONNECTION_STATE", "disconnected")
-            finally:
-                self._connected = False
-                self._latest_frame = None
-                self._latest_memory_name = None
-                self._latest_slot = None
-                self._close_client()
-
-    def _require_connected(self) -> None:
-        if not self._connected:
+    def _require_device(self) -> CameraServiceDevice:
+        if not self._connected or self._device is None:
             raise RuntimeError("camera IOC detector is not connected")
+        return self._device
+
+    async def _await_ready(self, device: CameraServiceDevice) -> None:
+        """Wait for backend admission and surface an IOC failure immediately."""
+        deadline = asyncio.get_running_loop().time() + self.timeout
+        while True:
+            state = str(await device.connection_state.get_value(cached=False))
+            if state == ServiceConnectionState.READY.value:
+                return
+            if state == ServiceConnectionState.FAULTED.value:
+                error = str(await device.last_error.get_value(cached=False))
+                detail = error or "the IOC did not report a backend error"
+                raise RuntimeError(f"camera IOC backend connection failed: {detail}")
+            if asyncio.get_running_loop().time() >= deadline:
+                raise TimeoutError("camera IOC did not enter its ready state")
+            await asyncio.sleep(self.poll_interval)
+
+    async def _await_descriptor(
+        self, device: CameraServiceDevice
+    ) -> tuple[int, int, int, str, str, str, str, str, str, int, str, str]:
+        """Read the atomically published descriptor after the trigger command.
+
+        The Caproto IOC writes each descriptor PV before incrementing
+        ``FRAMES_PUBLISHED``.  Explicit ophyd-async reads avoid accepting an
+        older monitor-cache value while Channel Access delivers that update.
+        """
+        deadline = asyncio.get_running_loop().time() + self.timeout
+        while True:
+            values = await asyncio.gather(
+                device.descriptor_generation.get_value(cached=False),
+                device.descriptor_sequence.get_value(cached=False),
+                device.descriptor_slot.get_value(cached=False),
+                device.descriptor_name.get_value(cached=False),
+                device.descriptor_run_id.get_value(cached=False),
+                device.descriptor_frame_id.get_value(cached=False),
+                device.descriptor_shape.get_value(cached=False),
+                device.descriptor_dtype.get_value(cached=False),
+                device.descriptor_byte_order.get_value(cached=False),
+                device.descriptor_timestamp_ns.get_value(cached=False),
+                device.descriptor_checksum_hi.get_value(cached=False),
+                device.descriptor_checksum_lo.get_value(cached=False),
+            )
+            if values[6]:
+                return cast(
+                    "tuple[int, int, int, str, str, str, str, str, str, int, str, str]",
+                    values,
+                )
+            if asyncio.get_running_loop().time() >= deadline:
+                raise TimeoutError("camera IOC did not publish a descriptor")
+            await asyncio.sleep(self.poll_interval)
 
     def _require_latest(self, sequence: int) -> Frame:
         frame = self._latest_frame
         if frame is None or frame.sequence != sequence:
             raise ValueError("camera IOC sequence does not match the latest frame")
         return frame
-
-    def _await(self, suffix: str, expected: object) -> None:
-        deadline = time.monotonic() + self.timeout
-        while time.monotonic() < deadline:
-            try:
-                value = self._read(suffix)
-                if isinstance(value, bytes):
-                    value = value.decode()
-                if value == expected:
-                    return
-            except Exception:
-                pass
-            time.sleep(self.poll_interval)
-        raise TimeoutError(f"{self.prefix}{suffix} did not become {expected!r}")
-
-    def _integer(self, suffix: str) -> int:
-        return int(self._text(suffix))
-
-    def _text(self, suffix: str) -> str:
-        value = self._read(suffix)
-        return value.decode() if isinstance(value, bytes) else str(value)
-
-    def _read(self, suffix: str) -> object:
-        return self._pv(suffix).read(timeout=self.timeout).data[0]
-
-    def _write(self, suffix: str, value: int) -> None:
-        self._pv(suffix).write(
-            value,
-            notify=True,
-            timeout=self.timeout,
-        )
-
-    def _open_client(self) -> None:
-        if self._context is not None:
-            return
-        suffixes = (
-            "SERVICE_ID",
-            "CONNECTION_STATE",
-            "ACQUISITION_STATE",
-            "COMMAND_STATE",
-            "FRAMES_PUBLISHED",
-            "DESCRIPTOR_GENERATION",
-            "DESCRIPTOR_SEQUENCE",
-            "DESCRIPTOR_SLOT",
-            "DESCRIPTOR_NAME",
-            "DESCRIPTOR_RUN_ID",
-            "DESCRIPTOR_FRAME_ID",
-            "DESCRIPTOR_SHAPE",
-            "DESCRIPTOR_DTYPE",
-            "DESCRIPTOR_BYTE_ORDER",
-            "DESCRIPTOR_TIMESTAMP_NS",
-            "DESCRIPTOR_CHECKSUM_HI",
-            "DESCRIPTOR_CHECKSUM_LO",
-            "COMMAND:CONNECT",
-            "COMMAND:ARM",
-            "COMMAND:TRIGGER",
-            "COMMAND:STOP",
-            "COMMAND:DISCONNECT",
-            "COMMAND:ACKNOWLEDGE",
-        )
-        context = Context(timeout=self.timeout)
-        pvs = context.get_pvs(
-            *(f"{self.prefix}{suffix}" for suffix in suffixes), timeout=self.timeout
-        )
-        self._context = context
-        self._pvs = dict(zip(suffixes, pvs, strict=True))
-
-    def _close_client(self) -> None:
-        context, self._context = self._context, None
-        self._pvs.clear()
-        if context is not None:
-            context.disconnect()
-
-    def _pv(self, suffix: str) -> Any:
-        try:
-            return self._pvs[suffix]
-        except KeyError as exc:
-            raise RuntimeError(
-                f"camera IOC PV suffix is not configured: {suffix}"
-            ) from exc
 
 
 __all__ = ["EpicsCameraDetector"]

@@ -6,7 +6,8 @@ import asyncio
 from typing import Annotated as A
 
 from ophyd_async.core import AsyncStatus, SignalR, SignalW, TriggerableCommand
-from ophyd_async.epics.core import EpicsDevice, PvSuffix
+from ophyd_async.epics.core import PvSuffix
+from redsun.device.epics import EpicsServiceDevice
 
 from redsun_aht.domain import (
     AcquisitionState,
@@ -15,7 +16,7 @@ from redsun_aht.domain import (
 )
 
 
-class CameraServiceDevice(EpicsDevice):
+class CameraServiceDevice(EpicsServiceDevice):
     """Typed application-side view of one camera service IOC."""
 
     service_id: A[SignalR[str], PvSuffix("SERVICE_ID")]
@@ -58,8 +59,7 @@ class CameraServiceDevice(EpicsDevice):
     def __init__(self, prefix: str, *, name: str) -> None:
         if not prefix.endswith(":"):
             raise ValueError("camera service prefix must end with ':'")
-        self.epics_prefix = prefix
-        super().__init__(prefix=prefix, name=name)
+        super().__init__(name, prefix=prefix)
 
     async def request_connect(self) -> None:
         """Ask the service to connect its isolated backend."""
@@ -87,6 +87,21 @@ class CameraServiceDevice(EpicsDevice):
     async def request_disconnect(self) -> None:
         """Ask the service to disconnect its isolated backend."""
         await self.command_disconnect.trigger()
+
+    async def shutdown(self) -> None:
+        """Leave the isolated camera service idle and disconnected."""
+        try:
+            state = await self.connection_state.get_value()
+        except Exception:
+            # The application container may own a device that was declared but
+            # never connected; there is no service lifecycle to release.
+            return
+        if state == ServiceConnectionState.DISCONNECTED.value:
+            return
+        try:
+            await self.stop()
+        finally:
+            await self.request_disconnect()
 
     async def acknowledge(self, sequence: int) -> None:
         """Acknowledge one exact lossless descriptor after durable copy."""
@@ -119,7 +134,7 @@ class CameraServiceDevice(EpicsDevice):
         )
         return HardwareServiceStatus(
             service_id=service_id,
-            epics_prefix=self.epics_prefix,
+            epics_prefix=self.service_prefix,
             schema_generation=generation,
             heartbeat_ns=int(heartbeat * 1_000_000_000),
             connection_state=ServiceConnectionState(connection),

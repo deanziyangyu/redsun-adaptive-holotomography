@@ -5,9 +5,10 @@ from __future__ import annotations
 import argparse
 import asyncio
 import time
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import suppress
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Protocol
+from typing import TYPE_CHECKING, Any, Protocol, TypeVar
 from uuid import uuid4
 
 import numpy as np
@@ -18,9 +19,12 @@ from redsun_aht.buffers import BufferFullError, SharedMemoryFrameRing
 from redsun_aht.domain import BufferUsage, FrameBufferDescriptor
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    from collections.abc import Callable, Sequence
 
     from redsun_aht.device.camera.mmcore import CameraIdentity
+
+
+T = TypeVar("T")
 
 
 class CameraBackend(Protocol):
@@ -206,6 +210,12 @@ class CameraServiceIOC(PVGroup):  # type: ignore[misc]  # caproto has no type me
         self._live_publish_hz = live_publish_hz
         self._live_buffer_memory_mb = live_buffer_memory_mb
         self._live_task: asyncio.Task[None] | None = None
+        self._connect_task: asyncio.Task[None] | None = None
+        self._backend_lock = asyncio.Lock()
+        self._backend_executor = ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix=f"camera-{service_id}",
+        )
         super().__init__(prefix)
 
     @service_id.startup  # type: ignore[no-redef,untyped-decorator]
@@ -224,42 +234,55 @@ class CameraServiceIOC(PVGroup):  # type: ignore[misc]  # caproto has no type me
         """Connect and admit the configured process-local camera backend."""
         del instance
         if value:
-            try:
-                if self._backend is not None:
-                    identity = self._backend.connect()
-                    await self.camera_adapter.write(identity.adapter)
-                    await self.camera_device.write(identity.device_name)
-                    await self.camera_serial.write(identity.serial or "")
-                    properties = getattr(self._backend, "properties", lambda: ())()
-                    property_values = {
-                        property_.name: property_.value for property_ in properties
-                    }
-                    await self.camera_pixel_binning.write(
-                        property_values.get(
-                            "PixelBinning", property_values.get("Binning", "")
-                        )
-                    )
-                    await self.camera_pixel_type.write(
-                        property_values.get(
-                            "PixelType", property_values.get("Pixel Format", "")
-                        )
-                    )
-                    await self.camera_exposure_ms.write(
-                        getattr(
-                            self._backend,
-                            "configured_exposure_ms",
-                            lambda: property_values.get("Exposure", ""),
-                        )()
-                    )
-                await self.connection_state.write("ready")
-                await self.command_state.write("connected")
-                await self.last_error.write("")
-            except Exception as exc:
-                await self.connection_state.write("faulted")
-                await self.command_state.write("connect_failed")
-                await self.last_error.write(str(exc))
-                raise
+            if self._connect_task is not None:
+                raise RuntimeError("camera service connection is already in progress")
+            await self.connection_state.write("connecting")
+            await self.command_state.write("connecting")
+            await self.last_error.write("")
+            self._connect_task = asyncio.create_task(self._connect_backend())
         return 0
+
+    async def _connect_backend(self) -> None:
+        """Admit the thread-affine camera backend without blocking CA puts."""
+        try:
+            if self._backend is not None:
+                identity = await self._run_backend(self._backend.connect)
+                await self.camera_adapter.write(identity.adapter)
+                await self.camera_device.write(identity.device_name)
+                await self.camera_serial.write(identity.serial or "")
+                properties = await self._run_backend(
+                    getattr(self._backend, "properties", lambda: ())
+                )
+                property_values = {
+                    property_.name: property_.value for property_ in properties
+                }
+                await self.camera_pixel_binning.write(
+                    property_values.get(
+                        "PixelBinning", property_values.get("Binning", "")
+                    )
+                )
+                await self.camera_pixel_type.write(
+                    property_values.get(
+                        "PixelType", property_values.get("Pixel Format", "")
+                    )
+                )
+                exposure_ms = await self._run_backend(
+                    getattr(
+                        self._backend,
+                        "configured_exposure_ms",
+                        lambda: property_values.get("Exposure", ""),
+                    )
+                )
+                await self.camera_exposure_ms.write(exposure_ms)
+            await self.connection_state.write("ready")
+            await self.command_state.write("connected")
+            await self.last_error.write("")
+        except Exception as exc:
+            await self.connection_state.write("faulted")
+            await self.command_state.write("connect_failed")
+            await self.last_error.write(str(exc))
+        finally:
+            self._connect_task = None
 
     @command_arm.putter  # type: ignore[no-redef,untyped-decorator]
     async def command_arm(self, instance: object, value: int) -> int:
@@ -275,7 +298,7 @@ class CameraServiceIOC(PVGroup):  # type: ignore[misc]  # caproto has no type me
                 await self.last_error.write("camera service is not connected")
                 raise RuntimeError("camera service is not connected")
             if self._backend is not None:
-                self._backend.arm()
+                await self._run_backend(self._backend.arm)
             await self.acquisition_state.write("armed")
             await self.command_state.write("armed")
             await self.last_error.write("")
@@ -301,9 +324,12 @@ class CameraServiceIOC(PVGroup):  # type: ignore[misc]  # caproto has no type me
             raise RuntimeError("camera is not idle")
         try:
             if self._backend is not None:
-                self._backend.start_sequence(
-                    interval_ms=0.0,
-                    buffer_memory_mb=self._live_buffer_memory_mb,
+                backend = self._backend
+                await self._run_backend(
+                    lambda: backend.start_sequence(
+                        interval_ms=0.0,
+                        buffer_memory_mb=self._live_buffer_memory_mb,
+                    )
                 )
             await self.live_state.write("running")
             await self.acquisition_state.write("live")
@@ -332,7 +358,7 @@ class CameraServiceIOC(PVGroup):  # type: ignore[misc]  # caproto has no type me
                 if self._backend is not None:
                     if self._acquisition_ring is not None:
                         self._acquisition_ring.ensure_writable()
-                    frame = np.asarray(self._backend.trigger())
+                    frame = np.asarray(await self._run_backend(self._backend.trigger))
                     descriptor = self._publish_frame(frame)
                     await self._write_descriptor(descriptor)
                 else:
@@ -369,7 +395,7 @@ class CameraServiceIOC(PVGroup):  # type: ignore[misc]  # caproto has no type me
         if value:
             await self._stop_live_task()
             if self._backend is not None and self.connection_state.value == "ready":
-                self._backend.stop()
+                await self._run_backend(self._backend.stop)
             await self.acquisition_state.write("idle")
             await self.live_state.write("idle")
             await self.command_state.write("stopped")
@@ -384,7 +410,7 @@ class CameraServiceIOC(PVGroup):  # type: ignore[misc]  # caproto has no type me
             self._close_ring()
             try:
                 if self._backend is not None:
-                    self._backend.disconnect()
+                    await self._run_backend(self._backend.disconnect)
             finally:
                 self._latest_descriptor = None
             await self.acquisition_state.write("idle")
@@ -424,8 +450,19 @@ class CameraServiceIOC(PVGroup):  # type: ignore[misc]  # caproto has no type me
                     )
                     overflowed = False
                 else:
-                    frames = self._backend.drain_sequence()
-                    overflowed = self._backend.sequence_overflowed()
+                    backend = self._backend
+
+                    def drain(
+                        bound_backend: CameraBackend = backend,
+                    ) -> tuple[tuple[np.ndarray[Any, Any], ...], bool]:
+                        return (
+                            bound_backend.drain_sequence(),
+                            bound_backend.sequence_overflowed(),
+                        )
+
+                    frames, overflowed = await self._run_backend(
+                        drain
+                    )
                 if overflowed:
                     await self.live_buffer_overruns.write(
                         int(self.live_buffer_overruns.value) + 1
@@ -435,7 +472,7 @@ class CameraServiceIOC(PVGroup):  # type: ignore[misc]  # caproto has no type me
                     await self.command_state.write("live_overrun")
                     await self.last_error.write("MMCore circular buffer overflowed")
                     if self._backend is not None:
-                        self._backend.stop()
+                        await self._run_backend(self._backend.stop)
                     return
                 if frames:
                     drained = int(self.live_frames_drained.value) + len(frames)
@@ -456,7 +493,7 @@ class CameraServiceIOC(PVGroup):  # type: ignore[misc]  # caproto has no type me
             await self.command_state.write("live_failed")
             await self.last_error.write(str(exc))
             if self._backend is not None:
-                self._backend.stop()
+                await self._run_backend(self._backend.stop)
         finally:
             if self._live_task is asyncio.current_task():
                 self._live_task = None
@@ -491,6 +528,12 @@ class CameraServiceIOC(PVGroup):  # type: ignore[misc]  # caproto has no type me
         task.cancel()
         with suppress(asyncio.CancelledError):
             await task
+
+    async def _run_backend(self, operation: Callable[[], T]) -> T:
+        """Run one thread-affine camera-SDK operation without blocking CA."""
+        async with self._backend_lock:
+            loop = asyncio.get_running_loop()
+            return await loop.run_in_executor(self._backend_executor, operation)
 
     def _publish_frame(self, frame: np.ndarray[Any, Any]) -> FrameBufferDescriptor:
         ring = self._acquisition_ring

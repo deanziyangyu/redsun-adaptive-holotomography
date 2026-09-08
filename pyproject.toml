@@ -31,9 +31,9 @@ dependencies = [
   "msgspec>=0.21.1,<0.22",
   "numpy>=2,<3",
   "opencv-python-headless==4.14.0.94",
-  "ophyd-async==0.21.1",
+  "ophyd-async[ca]>=0.21.2,<0.22",
   "psygnal>=0.15,<0.16",
-  "redsun[zarr]==0.11.0",
+  "redsun[epics,zarr]>=0.12.2,<0.13",
   "zarr==3.3.0",
 ]
 
@@ -68,11 +68,11 @@ catalog-tiled = [
 ]
 pyqt = [
   "napari[pyqt6]>=0.6.6",
-  "redsun[pyqt]==0.11.0",
+  "redsun[pyqt]>=0.12.2,<0.13",
 ]
 pyside = [
   "napari[pyside6]>=0.6.6",
-  "redsun[pyside]==0.11.0",
+  "redsun[pyside]>=0.12.2,<0.13",
 ]
 
 [project.scripts]
@@ -81,6 +81,9 @@ aht-camera-ioc = "redsun_aht.services.camera_ioc:main"
 
 [project.entry-points."redsun.plugins"]
 redsun-aht = "redsun.yaml"
+
+[tool.uv.sources]
+redsun = { path = "../redsun", editable = true }
 
 [tool.hatch.build.targets.sdist]
 include = ["src", "tests", "docs"]
@@ -121,6 +124,12 @@ testpaths = ["tests"]
 markers = [
   "catalog: requires the optional local Tiled catalog runtime",
   "hardware: requires explicitly enabled physical hardware",
+  "core: pure domain, transport, manifest, or buffer contract coverage",
+  "redsun: validates RedSun-owned profiles, containers, plans, presenters, or views",
+  "service: validates AHT device adapters, simulated services, or isolated IOCs",
+  "processing: validates detached processing, reconstruction, or GPU orchestration",
+  "gui: validates AHT-customized RedSun QtView composition",
+  "integration: validates composition across application boundaries",
 ]
 
 [tool.ruff]

@@ -76,8 +76,12 @@ container ownership.
 
 ### AHT impact
 
-Blocked until the upstream API is manually approved and merged. Caproto IOC
-work may continue because it is below the application-device boundary.
+The dedicated AHT hardware branch (`hw/aht-redsun-integration`) consumes the
+candidate explicitly from the sibling `redsun` checkout on `feat/pre-upstream`.
+It routes the application-side lossless detector through the RedSun
+`EpicsServiceDevice` and ophyd-async while retaining Caproto inside the IOC.
+This is review evidence, not a production dependency: promotion still requires
+an accepted upstream API and release or an explicit approved pin.
 
 ### Local upstream review candidate
 

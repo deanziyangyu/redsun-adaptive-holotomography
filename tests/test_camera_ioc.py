@@ -16,6 +16,8 @@ import aioca
 import numpy as np
 import pytest
 from caproto.sync.client import read, write
+from ophyd_async.core import wait_for_value
+from redsun.device.epics import EpicsServiceDevice
 
 from redsun_aht.device import CameraServiceDevice
 from redsun_aht.device.camera.profiles import PVCAM_FCS_PROPERTIES
@@ -67,6 +69,12 @@ def test_camera_ioc_lifecycle_hooks() -> None:
         await ioc.command_connect.pvspec.put(ioc, ioc.command_connect, 1)
         with pytest.raises(RuntimeError, match="not armed"):
             await ioc.command_trigger.pvspec.put(ioc, ioc.command_trigger, 1)
+        for _ in range(100):
+            if ioc.connection_state.value == "ready":
+                break
+            await asyncio.sleep(0)
+        else:
+            raise TimeoutError("camera service did not enter its ready state")
         await ioc.command_arm.pvspec.put(ioc, ioc.command_arm, 1)
         await ioc.command_trigger.pvspec.put(ioc, ioc.command_trigger, 1)
         assert ioc.connection_state.value == "ready"
@@ -280,6 +288,7 @@ def test_simulated_live_ioc_publishes_epics_latest_frame() -> None:
     try:
         _await_value(f"{prefix}SCHEMA_GENERATION", 1)
         write(f"{prefix}COMMAND:CONNECT", 1, notify=True, repeater=False)
+        _await_value(f"{prefix}CONNECTION_STATE", "ready")
         write(f"{prefix}COMMAND:START_LIVE", 1, notify=True, repeater=False)
         _await_value(f"{prefix}LIVE_STATE", "running")
         deadline = time.monotonic() + 3.0
@@ -341,6 +350,7 @@ def test_two_live_iocs_command_independently_and_restart() -> None:
         _await_value(f"{first_prefix}SCHEMA_GENERATION", 1)
         _await_value(f"{second_prefix}SCHEMA_GENERATION", 1)
         write(f"{first_prefix}COMMAND:CONNECT", 1, notify=True, repeater=False)
+        _await_value(f"{first_prefix}CONNECTION_STATE", "ready")
         write(f"{first_prefix}COMMAND:ARM", 1, notify=True, repeater=False)
         write(f"{first_prefix}COMMAND:TRIGGER", 1, notify=True, repeater=False)
         _await_value(f"{first_prefix}FRAMES_PUBLISHED", 1)
@@ -349,16 +359,22 @@ def test_two_live_iocs_command_independently_and_restart() -> None:
         async def exercise_ophyd_device() -> None:
             try:
                 device = CameraServiceDevice(second_prefix, name="second")
+                assert isinstance(device, EpicsServiceDevice)
                 await device.connect(timeout=3)
                 await device.request_connect()
+                await wait_for_value(
+                    device.connection_state,
+                    ServiceConnectionState.READY.value,
+                    timeout=3,
+                )
                 await device.arm()
                 await device.trigger()
                 status = await device.health()
                 assert status.service_id == "second"
                 assert status.connection_state is ServiceConnectionState.READY
                 assert status.frames_published == 1
-                await device.stop()
-                await device.request_disconnect()
+                await device.shutdown()
+                assert await device.connection_state.get_value() == "disconnected"
             finally:
                 aioca.purge_channel_caches()
 
@@ -373,6 +389,62 @@ def test_two_live_iocs_command_independently_and_restart() -> None:
         assert _read_value(f"{first_prefix}FRAMES_PUBLISHED") == 0
     finally:
         _stop_ioc(restarted)
+
+
+@pytest.mark.integration
+@pytest.mark.skipif(
+    "AHT_TEST_MMCORE_PATH" not in os.environ,
+    reason="set AHT_TEST_MMCORE_PATH for the full descriptor integration test",
+)
+def test_lossless_detector_routes_caproto_ioc_through_ophyd_async(
+    tmp_path: Path,
+) -> None:
+    prefix = "AHT:TEST:DETECTOR:"
+    port = _available_udp_port()
+    os.environ["EPICS_CA_ADDR_LIST"] = f"127.0.0.1:{port}"
+    os.environ["EPICS_CA_AUTO_ADDR_LIST"] = "NO"
+    config_path = tmp_path / "detector.cfg"
+    config_path.write_text(
+        "\n".join(
+            (
+                "Property,Core,Initialize,0",
+                "Device,Camera,DemoCamera,DCam",
+                "Property,Core,Initialize,1",
+                "Property,Core,Camera,Camera",
+                "Property,Core,AutoShutter,0",
+            )
+        ),
+        encoding="utf-8",
+    )
+    process = _start_mmcore_ioc(
+        "detector",
+        prefix,
+        port,
+        mm_path=Path(os.environ["AHT_TEST_MMCORE_PATH"]),
+        config_path=config_path,
+        log_path=tmp_path / "detector.log",
+    )
+    try:
+        _await_value(f"{prefix}SCHEMA_GENERATION", 1)
+
+        environment = os.environ.copy()
+        environment["EPICS_CA_ADDR_LIST"] = f"127.0.0.1:{port}"
+        environment["EPICS_CA_AUTO_ADDR_LIST"] = "NO"
+        client = subprocess.run(
+            [
+                sys.executable,
+                str(Path(__file__).with_name("epics_detector_client.py")),
+                "detector",
+                prefix,
+            ],
+            cwd=Path(__file__).parents[1],
+            env=environment,
+            capture_output=True,
+            text=True,
+        )
+        assert client.returncode == 0, client.stderr
+    finally:
+        _stop_ioc(process)
 
 
 @pytest.mark.skipif(
@@ -425,6 +497,8 @@ def test_two_live_mmcore_demo_iocs_use_separate_processes(tmp_path: Path) -> Non
         write(f"{second_prefix}COMMAND:CONNECT", 1, notify=True, repeater=False)
         _await_value(f"{first_prefix}CAMERA_ADAPTER", "DemoCamera")
         _await_value(f"{second_prefix}CAMERA_ADAPTER", "DemoCamera")
+        _await_value(f"{first_prefix}CONNECTION_STATE", "ready")
+        _await_value(f"{second_prefix}CONNECTION_STATE", "ready")
         write(f"{first_prefix}COMMAND:ARM", 1, notify=True, repeater=False)
         write(f"{first_prefix}COMMAND:TRIGGER", 1, notify=True, repeater=False)
         _await_value(f"{first_prefix}FRAMES_PUBLISHED", 1)
@@ -503,7 +577,9 @@ def test_one_real_mmcore_camera_beside_simulated_peer(tmp_path: Path) -> None:
             f"{real_prefix}CAMERA_SERIAL",
             os.environ["AHT_TEST_REAL_EXPECTED_SERIAL"],
         )
+        _await_value(f"{real_prefix}CONNECTION_STATE", "ready", timeout=15.0)
         write(f"{simulated_prefix}COMMAND:CONNECT", 1, notify=True, repeater=False)
+        _await_value(f"{simulated_prefix}CONNECTION_STATE", "ready")
         write(f"{simulated_prefix}COMMAND:ARM", 1, notify=True, repeater=False)
         write(f"{simulated_prefix}COMMAND:TRIGGER", 1, notify=True, repeater=False)
         _await_value(f"{simulated_prefix}FRAMES_PUBLISHED", 1)
@@ -584,6 +660,7 @@ def test_real_mmcore_frame_round_trip_beside_simulated_peer(tmp_path: Path) -> N
             repeater=False,
             timeout=15.0,
         )
+        _await_value(f"{real_prefix}CONNECTION_STATE", "ready", timeout=15.0)
         write(f"{real_prefix}COMMAND:ARM", 1, notify=True, repeater=False)
         write(
             f"{real_prefix}COMMAND:TRIGGER",

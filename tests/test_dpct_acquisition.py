@@ -192,13 +192,8 @@ def test_epics_camera_detector_requires_a_fixed_camera_configuration() -> None:
         EpicsCameraDetector("camera", "AHT:CAM:", poll_interval=0)
 
 
-def test_epics_camera_detector_decodes_epics_text_before_waiting(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_epics_camera_detector_uses_a_redsun_camera_service_device() -> None:
     detector = EpicsCameraDetector("camera", "AHT:CAM:")
-    monkeypatch.setattr(EpicsCameraDetector, "_read", lambda self, suffix: b"ready")
 
-    detector._await(
-        "CONNECTION_STATE",
-        "ready",
-    )
+    assert detector.service_id == "camera"
+    assert detector.prefix == "AHT:CAM:"

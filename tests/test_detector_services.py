@@ -7,7 +7,6 @@ import pytest
 
 from redsun_aht.buffers import BufferFullError
 from redsun_aht.configurations import DualDetectorSimulation
-from redsun_aht.device import ProcessingDeviceAdapter
 from redsun_aht.domain import AcquisitionState, ServiceConnectionState
 from redsun_aht.protocols import Detector, SupervisedDetector
 from redsun_aht.services import DetectorRegistry, MockCameraService
@@ -119,10 +118,6 @@ def test_registry_rejects_duplicate_identity_and_prefix() -> None:
         registry.register(MockCameraService("a", "AHT:B:"))
     with pytest.raises(ValueError, match="duplicate EPICS"):
         registry.register(MockCameraService("b", "AHT:A:"))
-
-
-def test_processing_device_compatibility_seam_is_public() -> None:
-    assert ProcessingDeviceAdapter.__name__ == "ProcessingDeviceAdapter"
 
 
 def test_empty_selection_and_failed_composition_cleanup() -> None:

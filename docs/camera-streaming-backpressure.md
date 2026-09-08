@@ -72,6 +72,55 @@ only the newest frame. The benchmark's synchronous GUI-style reader received
 transfer cost is about 42 ms/read. This is acceptable for non-blocking preview
 but establishes a separate GUI-delivery budget from camera capture.
 
+## Caproto IOC retest, 2026-09-08
+
+An isolated Caproto IOC was started for each camera from a copy of its base
+Micro-Manager configuration. PVCAM used `--pvcam-fcs-profile`; FLIR used the
+admitted `SpinnakerC` serial `20154173`, `Binning=2`, and the supplied
+`flir_high.cfg` profile with `Frame Rate=300`. Each case used the 60 Hz
+live-publish setting, counted `LIVE_FRAMES_DRAINED`, and stopped after reaching
+its target. There were zero MMCore buffer overruns and no IOC error in all
+three runs. `LIVE_FRAMES_SKIPPED` below means deliberate replacement of older
+preview candidates, not an acquisition loss.
+
+| Case | Drained / elapsed | Drain rate | Change from prior IOC result | Result |
+| --- | ---: | ---: | ---: | --- |
+| PVCAM single | 2,010 / 2.812 s | 715 fps | +6.6% versus 2,015 / 3.006 s | passes the 3.461 s / 2,000-frame gate |
+| FLIR single | 166 / 0.562 s | 295 fps | +1.8% versus 181 / 0.624 s | passes the 0.961 s / 160-frame gate |
+| PVCAM + FLIR, concurrent | PVCAM: 2,007 / 2.812 s; FLIR: 161 / 0.547 s | PVCAM: 714 fps; FLIR: 294 fps | no prior dual baseline; within 0.2% / 0.4% of the respective single-camera rates | both pass |
+
+The PVCAM result confirms that the current full FCS profile and Caproto IOC
+remain within budget. An initial FLIR retest using `flir_base.cfg` measured
+about 95 fps; it omitted the required frame-rate setting and is not a valid
+comparison. With `flir_high.cfg`, both single and dual FLIR measurements are
+within the historical performance class. The prior documented IOC row included
+EPICS latest-image reads, whereas this control-plane measurement reads the
+drained counter only; retain that distinction when comparing future GUI-delivery
+measurements.
+
+## RedSun EPICS integration hardware verification, 2026-09-08
+
+After routing the application-side camera adapter through RedSun's
+`EpicsServiceDevice` and ophyd-async, the physical live-throughput check was
+repeated with the same camera-only configurations, 60 Hz IOC publish setting,
+and targets. The elapsed timer begins only after `LIVE_STATE=running`; it
+therefore measures sequence draining rather than `startSequenceAcquisition`
+startup. A preliminary startup-inclusive pass was intentionally excluded from
+the comparison because it adds approximately 0.2--0.3 s and is not comparable
+to the earlier table.
+
+| Case | Drained / elapsed | Drain rate | Change from 2026-09-08 recorded result | Result |
+| --- | ---: | ---: | ---: | --- |
+| PVCAM single | 2,011 / 2.781 s | 726 fps | +1.6% versus 715 fps | passes |
+| FLIR single | 161 / 0.531 s | 315 fps | +6.8% versus 295 fps | passes |
+| PVCAM + FLIR, concurrent | PVCAM: 2,020 / 2.813 s; FLIR: 166 / 0.562 s | PVCAM: 718 fps; FLIR: 308 fps | +0.6% / +4.8% versus 714 / 294 fps | both pass |
+
+All services reported zero MMCore buffer overruns and an empty IOC error field.
+The preview `LIVE_FRAMES_SKIPPED` counts remained high, as intended for a
+latest-wins preview lane, and are not acquisition losses. This confirms that
+the RedSun/ophyd-async application-side integration did not regress the
+process-isolated Caproto capture path under this control-plane measurement.
+
 ## Present behavior
 
 Implemented behavior is deliberately conservative:

@@ -21,8 +21,8 @@ parity with either application is not a requirement.
 |---|---|---|
 | Engine | `redsun.engine.RunEngine` | DPCT and processing-flyer execution use the RedSun engine; architecture tests reject direct Bluesky engine imports |
 | Profiles | RedSun AppConfig/YAML and plugin manifest | Packaged RedSun YAML profiles replace the parallel `ApplicationProfile` model |
-| Devices | RedSun-declared ophyd devices | DPCT stage, illumination, and detector groups are RedSun-declared facades; online camera cutover waits for the upstream EPICS base |
-| EPICS | Public RedSun EPICS abstract device | The camera adapter derives directly from ophyd-async `EpicsDevice`; RedSun 0.11 has no corresponding public base |
+| Devices | RedSun-declared ophyd devices | DPCT stage, illumination, detector groups, and the online camera service are RedSun-declared facades |
+| EPICS | Public RedSun EPICS abstract device | The AHT hardware branch consumes RedSun `feat/pre-upstream`'s `EpicsServiceDevice`; production cutover remains subject to upstream review/release |
 | DPCT plan | Bluesky generator executed by RedSun | The public simulation path runs `dpct_plan` through RedSun; the old async runner remains only as a compatibility surface for existing low-level tests/callers |
 | Views | AHT-customized RedSun `QtView` components | Camera, finite multishot, and processing widgets are `QtView` components; processing retains its AHT Napari layout |
 | Offline processing | Hardware-free RedSun container | CLI and GUI processing composition now build RedSun containers around the detached processing presenter |
@@ -68,8 +68,9 @@ Three areas intentionally differ from Mimir while remaining RedSun-native:
    RedSun-declared ophyd facades and a Bluesky generator plan.
 4. Convert camera and offline-processing frontends to AHT-customized RedSun
    `QtView` composition without adopting Mimir's application container.
-5. Prepare the EPICS base/device-shutdown upstream change for manual review;
-   cut AHT camera adapters over only after the accepted RedSun API is merged.
+5. Keep the EPICS base/device-shutdown upstream change reviewable; validate the
+   AHT camera adapter on its dedicated hardware branch before an accepted
+   RedSun release is promoted to production profiles.
 6. Prototype the durable multidimensional storage requirements upstream and
    prepare issue-ready compatibility evidence. Preserve AHT's current durable
    DPCT store until RedSun can represent its semantics without loss.
@@ -79,22 +80,18 @@ Three areas intentionally differ from Mimir while remaining RedSun-native:
 
 ## Testing unmerged RedSun changes on local hardware
 
-Short-lived branches tracked to `deanziyangyu/redsun` are appropriate for
-hardware characterization before a RedSun change is merged, provided they are
-treated as experiments rather than AHT dependencies. Use a dedicated RedSun
-worktree and virtual environment for each hardware experiment, branch from the
-exact upstream commit under review, and track the branch to the personal fork
-(`origin`), never canonical `upstream`.
+The throwaway integration branch belongs in AHT, not RedSun. The current branch
+is `hw/aht-redsun-integration`; it resolves its editable `../redsun` path
+dependency to `feat/pre-upstream` at `1a1879f`. `feat/upstream` remains the
+review-ready RedSun snapshot, while `feat/pre-upstream` is the RedSun working
+line. Record both repository commits in every hardware test report.
 
-Keep AHT's normal lock file pinned to a released RedSun version. In the
-hardware worktree only, install the candidate RedSun checkout as an editable or
-path dependency and record both repository commit IDs in the test report.
 Hardware-only tests must remain explicitly selected, preserve normal operator
 interlocks, and never run as part of the default suite. Put reusable contract
 tests in RedSun and AHT-specific integration or device-admission tests in AHT.
 
 Do not accumulate unrelated experiments on `feat/upstream`. Prefer one branch
 or stacked worktree per upstream proposal, rebase it as the upstream API moves,
-and delete it after merge or rejection. Production profiles and the committed
-AHT lock must not depend on those branches; cut over only after the accepted
-RedSun API is released or intentionally pinned to an approved commit.
+and delete it after merge or rejection. Promote the AHT hardware branch's
+candidate dependency into production profiles only after the RedSun API is
+accepted and released, or after an explicit approved pin.
