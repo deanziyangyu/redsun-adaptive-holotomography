@@ -12,13 +12,22 @@ def test_redsun_manifest_has_only_supported_sections() -> None:
     manifest = yaml.safe_load(manifest_path.read_text(encoding="utf-8"))
 
     assert manifest == {
-        "devices": {},
+        "devices": {
+            "dpct-detector-group": "redsun_aht.device:DpctDetectorGroupDevice",
+            "dpct-pattern": "redsun_aht.device:DpctPatternDevice",
+            "dpct-stage": "redsun_aht.device:DpctStageDevice",
+        },
         "presenters": {
+            "offline-processing": ("redsun_aht.presenter:OfflineProcessingPresenter"),
             "simulation-lifecycle": (
                 "redsun_aht.presenter:SimulationLifecyclePresenter"
-            )
+            ),
         },
-        "views": {},
+        "views": {
+            "camera-acquisition": ("redsun_aht.view.camera:CameraAcquisitionWidget"),
+            "multishot-scan": "redsun_aht.view.multishot:MultishotScanWidget",
+            "processing": "redsun_aht.view.processing:ProcessingWidget",
+        },
     }
     for group in ("devices", "presenters", "views"):
         for class_path in manifest[group].values():

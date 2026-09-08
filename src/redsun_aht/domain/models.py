@@ -119,6 +119,30 @@ class ProcessingExecutionMode(StrEnum):
     REPLAY = "replay"
 
 
+class MultiSliceAcquisitionMode(StrEnum):
+    """Input-domain contract for multi-slice reconstruction measurements.
+
+    The AHT instrument acquires real-valued amplitudes at several physical
+    focal positions.  The donor interferometric setup instead acquires a
+    complex field (real amplitude and imaginary phase) and can numerically
+    refocus it.  Keeping this distinction in the data contract prevents the
+    solver from silently applying interferometric preprocessing to AHT data.
+    """
+
+    AHT_REAL_AMPLITUDE_FOCAL_STACK = "aht_real_amplitude_focal_stack"
+    INTERFEROMETRIC_COMPLEX_FIELD = "interferometric_complex_field"
+
+    @property
+    def uses_numerical_refocusing(self) -> bool:
+        """Whether the acquisition requires digital refocusing before solve."""
+        return self is MultiSliceAcquisitionMode.INTERFEROMETRIC_COMPLEX_FIELD
+
+    @property
+    def requires_complex_field(self) -> bool:
+        """Whether both real and imaginary field components are required."""
+        return self is MultiSliceAcquisitionMode.INTERFEROMETRIC_COMPLEX_FIELD
+
+
 class SolverState(StrEnum):
     """Explicit detached solver lifecycle states."""
 

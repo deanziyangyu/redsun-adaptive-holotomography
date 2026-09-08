@@ -9,6 +9,8 @@ from redsun.presenter.builtins import StoragePresenter
 
 from redsun_aht.presenter import SimulationLifecyclePresenter
 
+from .profiles import profile_path
+
 if TYPE_CHECKING:
     from collections.abc import Mapping
     from pathlib import Path
@@ -59,16 +61,13 @@ def build_redsun_simulation_container(base_dir: Path) -> RedSunSimulationContain
     """Return an unbuilt, GUI-free RedSun container with no devices."""
     resolved_base_dir = base_dir.resolve()
 
-    class AHTSimulationContainer(AppContainer):
+    class AHTSimulationContainer(AppContainer, config=profile_path("simulate")):
         storage_ctrl = declare_presenter(
             StoragePresenter, base_dir=str(resolved_base_dir)
         )
         lifecycle = declare_presenter(SimulationLifecyclePresenter)
 
-        def wire(self) -> None:
-            wire_storage_lifecycle(self, self.lifecycle, self.storage_ctrl)
-
-    return AHTSimulationContainer(session="aht-simulation")
+    return AHTSimulationContainer(session="AHT simulation", frontend="headless")
 
 
 def run_redsun_simulation_container(base_dir: Path) -> RedSunSimulationContainer:

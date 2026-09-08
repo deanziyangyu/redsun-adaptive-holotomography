@@ -435,6 +435,8 @@ def _multilayer_command_arguments(
         *(str(value) for value in reconstruction.padding_yx),
         "--multilayer-defocus-um",
         str(reconstruction.defocus_um),
+        "--multilayer-focus-offset-slices",
+        *(str(value) for value in reconstruction.focus_offsets_slices),
         "--multilayer-normalization",
         reconstruction.normalization,
         "--multilayer-memory-budget-mib",
@@ -460,6 +462,25 @@ def _multilayer_command_arguments(
     ]
     if solve.step_size is not None:
         arguments.extend(("--multilayer-step-size", str(solve.step_size)))
+    if solve.early_stopping_relative is not None:
+        arguments.extend(
+            (
+                "--multilayer-early-stopping-relative",
+                str(solve.early_stopping_relative),
+            )
+        )
+    if solve.subtract_first_slice_mean:
+        arguments.append("--multilayer-subtract-first-slice-mean")
+    if reconstruction.illumination_fxy is not None:
+        for fx, fy in reconstruction.illumination_fxy:
+            arguments.extend(("--multilayer-illumination-fxy", str(fx), str(fy)))
+    if reconstruction.skip_shots:
+        arguments.extend(
+            (
+                "--multilayer-skip-shots",
+                *(str(index) for index in reconstruction.skip_shots),
+            )
+        )
     if not solve.restart_on_loss_increase:
         arguments.append("--no-multilayer-restart")
     if solve.random_order:

@@ -1,0 +1,29 @@
+schema_version: 1.0
+frontend: headless
+session: AHT DPCT simulation
+metadata:
+  profile: simulate-dpct
+  description: hardware-free stage, illumination, and dual-detector DPCT plan
+  constructs_hardware: false
+  devices:
+    - id: stage
+      backend: mock
+    - id: illumination
+      backend: mock
+    - id: fluorescence
+      backend: mock
+    - id: dhm
+      backend: mock
+devices:
+  stage:
+    plugin_name: redsun-aht
+    plugin_id: dpct-stage
+  illumination:
+    plugin_name: redsun-aht
+    plugin_id: dpct-pattern
+  detectors:
+    plugin_name: redsun-aht
+    plugin_id: dpct-detector-group
+presenters: {}
+views: {}
+wiring: []

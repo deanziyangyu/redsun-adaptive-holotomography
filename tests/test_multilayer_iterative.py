@@ -71,7 +71,7 @@ def test_iterative_solver_is_deterministic_and_decreases_loss(
     assert first.loss_history == second.loss_history
 
 
-def test_iterative_solver_supports_random_order_field_and_pupil_recovery() -> None:
+def test_iterative_solver_supports_random_order_field_reconstruction() -> None:
     model, intensity, frequencies = _problem("multislice")
     field = np.sqrt(intensity).astype(np.complex64)
     result = solve_multilayer(
@@ -84,15 +84,27 @@ def test_iterative_solver_supports_random_order_field_and_pupil_recovery() -> No
             random_order=True,
             seed=4,
             measurement_domain="field",
-            recover_pupil=True,
-            pupil_step_size=1e-5,
-            pupil_update_method="gauss_newton",
         ),
     )
 
     assert result.loss_history[0] >= 0
     assert result.step_history == (2e-4,)
     assert np.max(np.abs(result.pupil_yx)) <= 1.0 + 1e-6
+
+
+def test_replacement_multislice_rejects_removed_pupil_recovery() -> None:
+    model, intensity, frequencies = _problem("multislice")
+    with pytest.raises(ValueError, match="does not recover the pupil"):
+        solve_multilayer(
+            model,
+            intensity,
+            frequencies,
+            MultiLayerSolveConfig(
+                max_iterations=1,
+                recover_pupil=True,
+                pupil_step_size=1e-5,
+            ),
+        )
 
 
 def test_iterative_solver_checks_cancellation_at_shot_boundaries() -> None:

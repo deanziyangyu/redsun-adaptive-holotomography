@@ -15,8 +15,15 @@ from .dpct_zarr import (
 from .journal import EventJournal, InvalidTransition, RunController, replay_events
 from .manifest import RunManifest, RunManifestStore
 from .memory import InMemoryOpenStore, InMemoryStorageIO
+from .multislice_schema import (
+    MULTISLICE_AXES,
+    MULTISLICE_SCHEMA_VERSION,
+    MultiSliceMeasurementSchema,
+)
 
 __all__ = [
+    "MULTISLICE_AXES",
+    "MULTISLICE_SCHEMA_VERSION",
     "CameraCaptureManifest",
     "CameraCaptureZarrReplay",
     "CameraCaptureZarrStore",
@@ -29,6 +36,7 @@ __all__ = [
     "InMemoryOpenStore",
     "InMemoryStorageIO",
     "InvalidTransition",
+    "MultiSliceMeasurementSchema",
     "RunController",
     "RunManifest",
     "RunManifestStore",

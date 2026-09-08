@@ -4612,6 +4612,10 @@ catalog-tiled = [
 gpu-cupy = [
     { name = "cupy-cuda12x" },
 ]
+matlab-msbp = [
+    { name = "h5py" },
+    { name = "scipy" },
+]
 pyqt = [
     { name = "napari", extra = ["pyqt6"] },
     { name = "redsun", extra = ["pyqt"] },
@@ -4643,6 +4647,7 @@ requires-dist = [
     { name = "cupy-cuda12x", marker = "extra == 'gpu-cupy'", specifier = "==14.2.0" },
     { name = "dependency-injector", specifier = ">=4.48,<5" },
     { name = "event-model", specifier = ">=1.24,<2" },
+    { name = "h5py", marker = "extra == 'matlab-msbp'", specifier = ">=3.15,<4" },
     { name = "msgspec", specifier = ">=0.21.1,<0.22" },
     { name = "napari", extras = ["pyqt6"], marker = "extra == 'pyqt'", specifier = ">=0.6.6" },
     { name = "napari", extras = ["pyside6"], marker = "extra == 'pyside'", specifier = ">=0.6.6" },
@@ -4656,10 +4661,11 @@ requires-dist = [
     { name = "redsun", extras = ["pyqt"], marker = "extra == 'pyqt'", specifier = "==0.11.0" },
     { name = "redsun", extras = ["pyside"], marker = "extra == 'pyside'", specifier = "==0.11.0" },
     { name = "redsun", extras = ["zarr"], specifier = "==0.11.0" },
+    { name = "scipy", marker = "extra == 'matlab-msbp'", specifier = ">=1.16,<2" },
     { name = "tiled", extras = ["server"], marker = "extra == 'catalog-tiled'", specifier = "==0.2.14" },
     { name = "zarr", specifier = "==3.3.0" },
 ]
-provides-extras = ["camera-mmcore", "stage-esp300", "gpu-cupy", "catalog-tiled", "pyqt", "pyside"]
+provides-extras = ["camera-mmcore", "stage-esp300", "gpu-cupy", "matlab-msbp", "catalog-tiled", "pyqt", "pyside"]
 
 [package.metadata.requires-dev]
 dev = [

@@ -23,6 +23,17 @@ Holotomographic Microscope.
 
 The distribution imports as `redsun_aht` and installs the `aht` command.
 
+RedSun is the required application boundary for acquisition engines, devices,
+profiles, presenters, views, and storage backends. The current implementation
+only partially satisfies that requirement: several workflows still bypass the
+corresponding RedSun interfaces. See
+[`docs/redsun-native-architecture.md`](docs/redsun-native-architecture.md) for
+the migration contract and [`docs/redsun-gap-report.md`](docs/redsun-gap-report.md)
+for framework additions that require manual upstream review. Mimir and
+pyhololab are behavior and operator-interface references, not parity targets.
+AHT keeps distinct offline composition, detached processing, and customized
+frontends while routing those features through RedSun.
+
 ## Development
 
 The project targets Python 3.12+ and pins the first compatibility baseline to
@@ -34,6 +45,11 @@ uv run pytest
 uv run ruff check .
 uv run mypy
 ```
+
+When the Napari extra is installed in a restricted Windows environment, pytest
+may auto-load Napari's theme fixture and fail before project tests run. See
+[`docs/testing.md`](docs/testing.md) for the targeted plugin-disable and local
+temporary-directory commands.
 
 Run a hardware-free lifecycle smoke test with:
 
@@ -63,9 +79,10 @@ uv run aht simulate-dpct
 ```
 
 The smoke recipe runs two simulated Z positions by two committed raw-8-bit MCU
-patterns and acquires both simulated detectors at every shot. Each immutable
-shot record associates the settled framed pose, pattern ID, ordered detector
-frames, exact run ID, and lossless acknowledgement. Cleanup stops detector
+patterns through RedSun-declared stage, illumination, and detector-group
+facades, using a Bluesky generator executed by `redsun.engine.RunEngine`. Each
+immutable shot record associates the settled framed pose, pattern ID, ordered
+detector frames, exact run ID, and lossless acknowledgement. Cleanup stops detector
 acquisition and stage motion, clears ordinary illumination output, disconnects
 both detector services, and unlinks their shared memory even on failure. See
 `docs/dpct-acquisition.md` for the ordering and scope contract.
@@ -83,9 +100,10 @@ workers with:
 uv run aht process-headless --input RUN_DIRECTORY --output PRODUCT_DIRECTORY
 ```
 
-The command starts persistent spawned workers for `mean-projection` and
-`quality-metrics`, submits both jobs before waiting, and sends only versioned
-MsgPack metadata and array references across process boundaries. The image-like
+The command builds the hardware-free `process-headless` RedSun container, whose
+processing presenter starts persistent spawned workers for `mean-projection`
+and `quality-metrics`. It submits both jobs before waiting and sends only
+versioned MsgPack metadata and array references across process boundaries. The image-like
 mean projection is published as OME-Zarr 0.5; the quality table uses a
 namespaced Zarr v3 array. Atomic result manifests provide deterministic cache
 and integrity replay. See `docs/detached-processing.md` for the worker and
@@ -338,7 +356,8 @@ firmware has been flashed or contacted by AHT.
 - `transport`: schema-versioned MsgPack service envelopes.
 - `processing`: hardware-free replay, reference-only MsgPack messages,
   independently supervised worker processes, CPU/GPU quantitative reference
-  kernels, and offline-only multi-layer Born/multislice numerical cores.
+  kernels, the offline-only multi-layer Born numerical core, and the replacement
+  defocus-diverse multislice/MSBP port with MATLAB dataset adapters.
 - `storage`: immutable run manifests, append-only event journals, and durable
   OME-Zarr bundles.
 - `catalog`: optional Tiled registration, source-run queries, external Zarr

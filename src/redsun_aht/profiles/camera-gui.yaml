@@ -1,0 +1,15 @@
+schema_version: 1.0
+frontend: pyqt
+session: AHT camera acquisition
+metadata:
+  profile: camera-gui
+  description: RedSun Qt client for an isolated camera EPICS service
+  constructs_hardware: false
+  devices: []
+devices: {}
+presenters: {}
+views:
+  camera_view:
+    plugin_name: redsun-aht
+    plugin_id: camera-acquisition
+wiring: []

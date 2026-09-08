@@ -2,19 +2,36 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
+from redsun.containers import AppContainer, declare_presenter
+
+from redsun_aht.presenter import OfflineProcessingPresenter
 from redsun_aht.processing import (
     OfflineMultiLayerJobRequest,
     OfflineProcessingRequest,
     OfflineTiledJobRequest,
     ProcessingBatchResult,
     resolve_offline_processing,
-    run_offline_processing_plan,
 )
+
+from .profiles import profile_path
 
 if TYPE_CHECKING:
     from pathlib import Path
+
+
+def build_processing_container() -> AppContainer:
+    """Build no hardware while giving RedSun the offline app lifecycle."""
+
+    class AHTOfflineProcessingContainer(
+        AppContainer, config=profile_path("process-headless")
+    ):
+        processing = declare_presenter(OfflineProcessingPresenter)
+
+    return AHTOfflineProcessingContainer(
+        session="AHT offline processing", frontend="headless"
+    )
 
 
 def run_processing_simulation(
@@ -37,7 +54,14 @@ def run_processing_simulation(
             multilayer=multilayer,
         )
     )
-    return run_offline_processing_plan(plan)
+    container = build_processing_container().build()
+    try:
+        presenter = cast(
+            "OfflineProcessingPresenter", container.presenters["processing"]
+        )
+        return presenter.execute_batch(plan)
+    finally:
+        container.shutdown()
 
 
-__all__ = ["run_offline_processing_plan", "run_processing_simulation"]
+__all__ = ["build_processing_container", "run_processing_simulation"]

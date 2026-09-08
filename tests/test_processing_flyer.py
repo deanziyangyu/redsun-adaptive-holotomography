@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import pytest
-from bluesky import RunEngine
+from redsun.engine import RunEngine
 
 from redsun_aht.configurations import (
     build_dpct_simulation,
@@ -145,7 +145,7 @@ def test_two_processing_flyers_run_in_one_bluesky_run(tmp_path: Path) -> None:
     engine(
         processing_flyer_plan(flyers, jobs, observations, source_run_id="flyer-run"),
         lambda name, document: documents.append((name, document)),
-    )
+    ).result()
 
     assert [name for name, _ in documents].count("start") == 1
     assert [name for name, _ in documents].count("stop") == 1
@@ -201,7 +201,7 @@ def test_processing_flyer_plan_abort_unstages_every_worker(tmp_path: Path) -> No
             processing_flyer_plan(
                 (flyer,), (job,), observations, source_run_id="flyer-run"
             )
-        )
+        ).result()
 
     assert flyer.worker.process_id is None
     assert flyer.result is None

@@ -9,15 +9,21 @@ from typing import TYPE_CHECKING, Any, Literal, cast
 
 import numpy as np
 
-from redsun_aht.domain import ProcessingJob, SolverCapabilities
+from redsun_aht.domain import (
+    MultiSliceAcquisitionMode,
+    ProcessingJob,
+    SolverCapabilities,
+)
 from redsun_aht.domain.models import JsonValue, thaw_json
 from redsun_aht.processing.multilayer import (
     MultiLayerConfig,
+    MultiSliceModel,
     create_multilayer_model,
 )
 from redsun_aht.processing.multilayer_iterative import (
     MultiLayerSolveConfig,
     solve_multilayer,
+    solve_multislice,
 )
 from redsun_aht.processing.quantitative import CupyQuantitativeRuntime
 from redsun_aht.processing.replay import read_observation_array
@@ -32,6 +38,22 @@ if TYPE_CHECKING:
     from redsun_aht.domain import Observation
 
 MULTILAYER_DONOR_COMMIT = "e8dd96bfa2d54784e00209769d594f305863b01a"
+MSBP_DONOR_VERSION = "2025-08-16"
+MSBP_DONOR_SHA256: dict[str, str] = {
+    "Recon_main.m": "b083a3a8974d1b082401b510da0833688f0a91a5e15fb83d0868e86e6f94c6b2",
+    "Recon_corefunction/MultiSlice_Forward.m": (
+        "1656d86eca1c746eff0a4821e983b7afa370d81c9ac3963a62d09b909baa2fd1"
+    ),
+    "Recon_corefunction/BPM_update.m": (
+        "5b11140e2bb33e4c393f977a025e71861c5afc27d1ecb264385f9130fd7a5ed3"
+    ),
+    "Recon_corefunction/generate_Prop_dataset.m": (
+        "93f6f7403a1a9f16be89aede97b807f3056c3f7e438e61eed5c5f2bf8ac2972"
+    ),
+    "Recon_corefunction/Rytov_recon_init.m": (
+        "48c8fc38618d13ee41e395f157468ed20064f04943c77de471ba1fbb36eefc2c"
+    ),
+}
 
 
 class MultiLayerKernel:
@@ -61,7 +83,7 @@ class MultiLayerKernel:
         )
         self.capabilities = SolverCapabilities(
             solver_id=f"multilayer-{model}-{backend}",
-            solver_version="1.0.0",
+            solver_version="2.0.0" if model == "multislice" else "1.0.0",
             dimensionality=(4,),
             required_channels=1,
             required_shots=1,
@@ -103,12 +125,33 @@ class MultiLayerKernel:
         configured_model = _string(reconstruction, "model")
         if configured_model != self.model_name:
             raise ValueError("multi-layer job model does not match worker")
+        mode_value = reconstruction.get(
+            "acquisition_mode",
+            MultiSliceAcquisitionMode.AHT_REAL_AMPLITUDE_FOCAL_STACK.value,
+        )
+        if not isinstance(mode_value, str):
+            raise ValueError("multi-layer acquisition mode is invalid")
+        try:
+            acquisition_mode = MultiSliceAcquisitionMode(mode_value)
+        except ValueError as error:
+            raise ValueError("multi-layer acquisition mode is unsupported") from error
         solve_config = _solve_config(reconstruction)
         source_z_index = _integer(reconstruction, "source_z_index")
         normalization = _string(reconstruction, "normalization")
         frequencies = np.asarray(
             _sequence(job.configuration, "illumination_fxy"), dtype=np.float64
         )
+        focus_offsets = _number_tuple(reconstruction, "focus_offsets_slices", None)
+        if (
+            configured_model == "multislice"
+            and acquisition_mode
+            is MultiSliceAcquisitionMode.AHT_REAL_AMPLITUDE_FOCAL_STACK
+            and focus_offsets != (0.0,)
+        ):
+            raise ValueError(
+                "AHT focal-stack acquisition does not use numerical refocusing"
+            )
+        skip_shots = _integer_tuple(reconstruction, "skip_shots", None)
         expected_estimate = _integer(job.configuration, "working_set_estimate_bytes")
         budget = job.resource_request.get("memory_budget_bytes")
         requested_estimate = job.resource_request.get("working_set_estimate_bytes")
@@ -129,6 +172,10 @@ class MultiLayerKernel:
         if not 0 <= source_z_index < sample.shape[1]:
             raise ValueError("multi-layer source Z index is out of range")
         measurements = np.asarray(sample[:, source_z_index])
+        measurement_dtype = (
+            np.complex64 if np.iscomplexobj(measurements) else np.float32
+        )
+        measurements = np.asarray(measurements, dtype=measurement_dtype)
         background_observation = None
         background_z_index = job.configuration.get("background_z_index")
         if normalization == "background":
@@ -146,15 +193,17 @@ class MultiLayerKernel:
                 or (background.shape[0], *background.shape[-2:]) != measurements.shape
             ):
                 raise ValueError("multi-layer background does not match sample SYX")
-            denominator = np.asarray(background[:, background_z_index], np.float32)
-            measurements = np.asarray(measurements, np.float32) / np.maximum(
-                denominator, np.finfo(np.float32).eps
+            denominator = np.asarray(background[:, background_z_index])
+            safe = np.where(
+                np.abs(denominator) > np.finfo(np.float32).eps,
+                denominator,
+                1,
             )
+            measurements = measurements / safe
         elif len(observations) != 1 or background_z_index is not None:
             raise ValueError("multi-layer job contains an unused background")
         elif normalization == "shot_mean":
-            measurements = np.asarray(measurements, np.float32)
-            shot_means = np.mean(measurements, axis=(-2, -1), dtype=np.float64)
+            shot_means = np.mean(np.abs(measurements), axis=(-2, -1), dtype=np.float64)
             if np.any(shot_means == 0):
                 raise ValueError("multi-layer shot normalization encountered zero mean")
             measurements /= shot_means[:, None, None]
@@ -162,7 +211,12 @@ class MultiLayerKernel:
             raise ValueError("multi-layer normalization is unsupported")
 
         shots, ny, nx = measurements.shape
-        recomputed_estimate = _working_set_estimate(model_config, shots)
+        recomputed_estimate = _working_set_estimate(
+            model_config,
+            shots,
+            model_name=self.model_name,
+            focus_planes=len(focus_offsets),
+        )
         if recomputed_estimate != expected_estimate or frequencies.shape != (shots, 2):
             raise ValueError("multi-layer resolved geometry changed after preflight")
 
@@ -173,13 +227,28 @@ class MultiLayerKernel:
         started_ns = time.perf_counter_ns()
         if self._runtime is None:
             model = create_multilayer_model(self.model_name, model_config)
-            solved = solve_multilayer(
-                model,
-                measurements,
-                frequencies,
-                solve_config,
-                check_cancelled=check_cancelled,
-            )
+            if self.model_name == "multislice":
+                if not isinstance(model, MultiSliceModel):
+                    raise RuntimeError(
+                        "multislice model factory returned the wrong type"
+                    )
+                solved = solve_multislice(
+                    model,
+                    measurements,
+                    frequencies,
+                    focus_offsets,
+                    skip_shots,
+                    solve_config,
+                    check_cancelled=check_cancelled,
+                )
+            else:
+                solved = solve_multilayer(
+                    model,
+                    measurements,
+                    frequencies,
+                    solve_config,
+                    check_cancelled=check_cancelled,
+                )
             output = np.asarray(solved.refractive_index_zyx, dtype=np.float32)
             pupil = np.asarray(solved.pupil_yx, dtype=np.complex64)
         else:
@@ -193,13 +262,28 @@ class MultiLayerKernel:
                 model = create_multilayer_model(
                     self.model_name, model_config, xp=runtime.xp
                 )
-                solved = solve_multilayer(
-                    model,
-                    runtime.xp.asarray(measurements),
-                    frequencies,
-                    solve_config,
-                    check_cancelled=check_cancelled,
-                )
+                if self.model_name == "multislice":
+                    if not isinstance(model, MultiSliceModel):
+                        raise RuntimeError(
+                            "multislice model factory returned the wrong type"
+                        )
+                    solved = solve_multislice(
+                        model,
+                        runtime.xp.asarray(measurements),
+                        frequencies,
+                        focus_offsets,
+                        skip_shots,
+                        solve_config,
+                        check_cancelled=check_cancelled,
+                    )
+                else:
+                    solved = solve_multilayer(
+                        model,
+                        runtime.xp.asarray(measurements),
+                        frequencies,
+                        solve_config,
+                        check_cancelled=check_cancelled,
+                    )
                 output = runtime.xp.asnumpy(solved.refractive_index_zyx)
                 pupil = runtime.xp.asnumpy(solved.pupil_yx)
             runtime.stream.synchronize()
@@ -245,19 +329,15 @@ class MultiLayerKernel:
             "working_set_estimate_bytes": expected_estimate,
             "pupil_sha256": hashlib.sha256(pupil.tobytes(order="C")).hexdigest(),
             "source": source,
-            "donor": {
-                "repository": "pyhololab",
-                "commit": MULTILAYER_DONOR_COMMIT,
-                "paths": [
-                    "src/core/multilayer_idt.py",
-                    "src/core/multilayer/models.py",
-                    "src/core/multilayer/regularizers.py",
-                ],
-            },
+            "donor": _donor_provenance(self.model_name),
             "scientific_status": (
-                "donor-characterized-cpu-reference"
-                if self.backend == "numpy"
-                else "cpu-equivalent-cupy-reference"
+                "cropped-40um-phantom-convergence-tested"
+                if self.model_name == "multislice"
+                else (
+                    "donor-characterized-cpu-reference"
+                    if self.backend == "numpy"
+                    else "cpu-equivalent-cupy-reference"
+                )
             ),
         }
         metrics: dict[str, JsonValue] = {
@@ -269,8 +349,11 @@ class MultiLayerKernel:
             "phase_change_per_slice": solved.phase_change_per_slice,
             "working_set_estimate_bytes": expected_estimate,
             "total_timing_ns": elapsed_ns,
-            "donor_commit": MULTILAYER_DONOR_COMMIT,
         }
+        if self.model_name == "multislice":
+            metrics["donor_version"] = MSBP_DONOR_VERSION
+        else:
+            metrics["donor_commit"] = MULTILAYER_DONOR_COMMIT
         if self._runtime is not None:
             metrics.update(
                 {
@@ -298,12 +381,47 @@ class MultiLayerKernel:
             self._runtime.close()
 
 
-def _working_set_estimate(config: MultiLayerConfig, shots: int) -> int:
-    model = create_multilayer_model("multislice", config)
+def _working_set_estimate(
+    config: MultiLayerConfig,
+    shots: int,
+    *,
+    model_name: str = "multislice",
+    focus_planes: int = 1,
+) -> int:
+    model = create_multilayer_model(model_name, config)
     _, ny, nx = config.shape_zyx
     return model.estimated_working_set_bytes(shots) + (
-        2 * shots * ny * nx * np.dtype(np.complex64).itemsize
+        2 * shots * focus_planes * ny * nx * np.dtype(np.complex64).itemsize
     )
+
+
+def _donor_provenance(model_name: str) -> dict[str, JsonValue]:
+    if model_name == "multislice":
+        return {
+            "repository": (
+                "ut-cwo/Inverse-scattering-in-biological-samples-via-beam-propagation"
+            ),
+            "version": MSBP_DONOR_VERSION,
+            "license": "BSD-3-Clause",
+            "citation_license_metadata": "MIT",
+            "paths": [
+                "Recon_main.m",
+                "Recon_corefunction/MultiSlice_Forward.m",
+                "Recon_corefunction/BPM_update.m",
+                "Recon_corefunction/generate_Prop_dataset.m",
+                "Recon_corefunction/Rytov_recon_init.m",
+            ],
+            "source_sha256": MSBP_DONOR_SHA256,
+        }
+    return {
+        "repository": "pyhololab",
+        "commit": MULTILAYER_DONOR_COMMIT,
+        "paths": [
+            "src/core/multilayer_idt.py",
+            "src/core/multilayer/models.py",
+            "src/core/multilayer/regularizers.py",
+        ],
+    }
 
 
 def _mapping(source: Mapping[str, JsonValue], key: str) -> Mapping[str, JsonValue]:
@@ -358,10 +476,10 @@ def _boolean(source: Mapping[str, JsonValue], key: str) -> bool:
 
 
 def _number_tuple(
-    source: Mapping[str, JsonValue], key: str, length: int
+    source: Mapping[str, JsonValue], key: str, length: int | None
 ) -> tuple[float, ...]:
     values = _sequence(source, key)
-    if len(values) != length or any(
+    if (length is not None and len(values) != length) or any(
         not isinstance(value, (int, float)) or isinstance(value, bool)
         for value in values
     ):
@@ -370,10 +488,10 @@ def _number_tuple(
 
 
 def _integer_tuple(
-    source: Mapping[str, JsonValue], key: str, length: int
+    source: Mapping[str, JsonValue], key: str, length: int | None
 ) -> tuple[int, ...]:
     values = _sequence(source, key)
-    if len(values) != length or any(
+    if (length is not None and len(values) != length) or any(
         not isinstance(value, int) or isinstance(value, bool) for value in values
     ):
         raise ValueError(f"multi-layer configuration has invalid {key}")
@@ -394,6 +512,7 @@ def _model_config(configuration: Mapping[str, JsonValue]) -> MultiLayerConfig:
         padding_yx=cast("tuple[int, int]", _integer_tuple(values, "padding_yx", 2)),
         defocus_um=_number(values, "defocus_um"),
         slice_binning_factor=_integer(values, "slice_binning_factor"),
+        allow_evanescent_pupil=_boolean(values, "allow_evanescent_pupil"),
     )
 
 
@@ -414,7 +533,13 @@ def _solve_config(reconstruction: Mapping[str, JsonValue]) -> MultiLayerSolveCon
         recover_pupil=_boolean(values, "recover_pupil"),
         pupil_step_size=_number(values, "pupil_step_size"),
         pupil_update_method=cast("Any", _string(values, "pupil_update_method")),
+        early_stopping_relative=_optional_float(values, "early_stopping_relative"),
+        subtract_first_slice_mean=_boolean(values, "subtract_first_slice_mean"),
     )
 
 
-__all__ = ["MULTILAYER_DONOR_COMMIT", "MultiLayerKernel"]
+__all__ = [
+    "MSBP_DONOR_VERSION",
+    "MULTILAYER_DONOR_COMMIT",
+    "MultiLayerKernel",
+]

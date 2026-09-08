@@ -5,14 +5,24 @@ from __future__ import annotations
 import asyncio
 import time
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
+
+from bluesky.run_engine import RunEngineResult
+from bluesky.utils import FailedStatus
+from redsun.containers import AppContainer, declare_device
+from redsun.engine import RunEngine
 
 from redsun_aht import __version__
 from redsun_aht.acquisition import (
     DpctRecipe,
-    DpctRunner,
     DpctRunResult,
+    dpct_plan,
     panel91_dpct_quadrant_patterns,
+)
+from redsun_aht.device import (
+    DpctDetectorGroupDevice,
+    DpctPatternDevice,
+    DpctStageDevice,
 )
 from redsun_aht.device.mcu import McuHostClient
 from redsun_aht.device.stage import (
@@ -25,6 +35,8 @@ from redsun_aht.motion import grid_scan
 from redsun_aht.services import MockCameraService
 from redsun_aht.storage import DpctZarrStore, RunManifest
 
+from .profiles import profile_path
+
 if TYPE_CHECKING:
     from pathlib import Path
 
@@ -33,13 +45,68 @@ if TYPE_CHECKING:
 class DpctSimulation:
     """Complete in-process DPCT composition with no physical backends."""
 
-    runner: DpctRunner
+    container: AppContainer
     recipe: DpctRecipe
     mcu: SimulatedMcu
 
     async def run(self) -> DpctRunResult:
-        """Execute the configured simulation and return traceable shot records."""
-        return await self.runner.run(self.recipe)
+        """Execute the RedSun device plan and return traceable shot records."""
+        engine = RunEngine({})
+        self.container.build()
+        try:
+            stage = cast("DpctStageDevice", self.container.devices["stage"])
+            illumination = cast(
+                "DpctPatternDevice", self.container.devices["illumination"]
+            )
+            detectors = cast(
+                "DpctDetectorGroupDevice", self.container.devices["detectors"]
+            )
+            future = engine(dpct_plan(stage, illumination, detectors, self.recipe))
+            try:
+                engine_result = await asyncio.wrap_future(future)
+            except FailedStatus as error:
+                cause = error.__cause__
+                if cause is not None:
+                    raise cause from error
+                raise
+            if not isinstance(engine_result, RunEngineResult):
+                raise RuntimeError("RedSun RunEngine did not return a plan result")
+            return cast("DpctRunResult", engine_result.plan_result)
+        finally:
+            self.container.shutdown()
+
+
+def _build_container(
+    *,
+    stage: CompositeStageDevice,
+    illumination: McuHostClient,
+    detectors: tuple[MockCameraService, ...],
+    recipe: DpctRecipe,
+    sink: DpctZarrStore | None,
+) -> AppContainer:
+    """Declare runtime backends behind RedSun-compatible device components."""
+    stage_backend = stage
+    illumination_backend = illumination
+    detector_backends = detectors
+    acquisition_recipe = recipe
+    frame_sink = sink
+
+    class AHTDpctSimulationContainer(
+        AppContainer, config=profile_path("simulate-dpct")
+    ):
+        stage = declare_device(DpctStageDevice, backend=stage_backend)
+        illumination = declare_device(DpctPatternDevice, backend=illumination_backend)
+        detectors = declare_device(
+            DpctDetectorGroupDevice,
+            detectors=detector_backends,
+            recipe=acquisition_recipe,
+            sink=frame_sink,
+        )
+
+    return AHTDpctSimulationContainer(
+        session=f"AHT DPCT simulation: {recipe.run_id}",
+        frontend="headless",
+    )
 
 
 def build_dpct_simulation(
@@ -112,9 +179,14 @@ def build_dpct_simulation(
             deployment={"profile": "simulate-dpct", "python": ">=3.12"},
         )
         sink = DpctZarrStore(output_root, run_manifest)
-    return DpctSimulation(
-        DpctRunner(stage, illumination, detectors, sink=sink), recipe, mcu
+    container = _build_container(
+        stage=stage,
+        illumination=illumination,
+        detectors=detectors,
+        recipe=recipe,
+        sink=sink,
     )
+    return DpctSimulation(container, recipe, mcu)
 
 
 def run_dpct_simulation(
@@ -210,9 +282,14 @@ def build_panel91_dpct_simulation(
             deployment={"profile": "simulate-panel91-dpct", "python": ">=3.12"},
         )
         sink = DpctZarrStore(output_root, run_manifest)
-    return DpctSimulation(
-        DpctRunner(stage, illumination, detectors, sink=sink), recipe, mcu
+    container = _build_container(
+        stage=stage,
+        illumination=illumination,
+        detectors=detectors,
+        recipe=recipe,
+        sink=sink,
     )
+    return DpctSimulation(container, recipe, mcu)
 
 
 __all__ = [

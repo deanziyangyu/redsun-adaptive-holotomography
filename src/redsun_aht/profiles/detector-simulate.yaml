@@ -1,0 +1,16 @@
+schema_version: 1.0
+frontend: headless
+session: AHT detector simulation
+metadata:
+  profile: detector-simulate
+  description: two isolated mock detector services and shared-memory rings
+  constructs_hardware: false
+  devices:
+    - id: fluorescence
+      backend: mock
+    - id: dhm
+      backend: mock
+devices: {}
+presenters: {}
+views: {}
+wiring: []

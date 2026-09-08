@@ -34,13 +34,32 @@ Only after all detector/position/pattern combinations exist is the hierarchy
 marked complete and the checksum-bearing acquisition manifest atomically
 published.
 
+## Multi-slice measurement extension
+
+The same OME-Zarr bundle is the canonical target for multi-slice migration.
+Its detector group records `aht.multislice` metadata and uses CZYX arrays for
+the measurement domain:
+
+- `aht_real_amplitude_focal_stack` stores real-amplitude data with physical
+  focal positions on the acquisition `Z` axis. It has no imaginary component
+  and no numerical refocusing.
+- `interferometric_complex_field` stores paired float32 real and imaginary
+  arrays. It may declare numerical focus offsets and is the representation used
+  by the supplied MATLAB bridge.
+
+The split-component representation is intentional: CuPy can retain the two
+float32 arrays without requiring a persistent complex64 allocation. HDF5/MAT
+files are compatibility inputs that will be converted into this contract by a
+later importer; they are not the canonical bundle format.
+
 ## Lossless acknowledgement boundary
 
-The DPCT runner now copies each exact retained detector sequence, validates its
-shape, dtype, and source checksum, and passes it to the durable sink. Detector
-acknowledgement occurs only after storage write, readback, checksum, and commit
-journal fsync succeed. Storage failure therefore leaves the acquisition buffer
-unacknowledged until ordinary cleanup disconnects the service.
+The RedSun DPCT detector-group facade copies each exact retained detector
+sequence, validates its shape, dtype, and source checksum, and passes it to the
+durable sink from the Bluesky generator plan. Detector acknowledgement occurs
+only after storage write, readback, checksum, and commit journal fsync succeed.
+Storage failure therefore leaves the acquisition buffer unacknowledged until
+ordinary plan cleanup disconnects the service.
 
 ## Replay
 

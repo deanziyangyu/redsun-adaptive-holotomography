@@ -6,6 +6,8 @@ from typing import Any
 
 import numpy as np
 from qtpy import QtCore, QtGui, QtWidgets
+from redsun.view import ViewPosition
+from redsun.view.qt import QtView
 
 from redsun_aht.presenter.camera import (
     AcquiredCameraFrame,
@@ -16,18 +18,25 @@ from redsun_aht.presenter.camera import (
 )
 
 
-class CameraAcquisitionWidget(QtWidgets.QWidget):
+class CameraAcquisitionWidget(QtView):
     """Explicit, single-frame GUI client for an already-running camera IOC."""
 
     def __init__(
         self,
-        prefix: str,
+        name: str,
+        /,
         *,
+        prefix: str | None = None,
         client: CameraGuiClient | None = None,
         live_client: LiveCameraGuiClient | None = None,
         parent: QtWidgets.QWidget | None = None,
     ) -> None:
-        super().__init__(parent)
+        if prefix is None:
+            prefix = name
+            name = "camera-acquisition"
+        super().__init__(name)
+        if parent is not None:
+            self.setParent(parent)
         self.prefix = prefix
         self.client = client or EpicsCameraGuiClient(prefix)
         self.live_client = live_client or EpicsLiveCameraGuiClient(prefix)
@@ -37,6 +46,11 @@ class CameraAcquisitionWidget(QtWidgets.QWidget):
         self._live_timer.setInterval(1000 // 60)
         self._live_timer.timeout.connect(self._poll_live)
         self._build_ui()
+
+    @property
+    def view_position(self) -> ViewPosition:
+        """Place the camera control and preview in the central workspace."""
+        return ViewPosition.CENTER
 
     def _build_ui(self) -> None:
         self.setWindowTitle("AHT camera acquisition")
@@ -167,14 +181,31 @@ class CameraAcquisitionWidget(QtWidgets.QWidget):
 def launch_camera_acquisition_gui(
     prefix: str, *, run_event_loop: bool = True
 ) -> CameraAcquisitionWidget:
-    """Show the GUI client without creating camera SDK or MMCore objects."""
-    application = QtWidgets.QApplication.instance()
-    if not isinstance(application, QtWidgets.QApplication):
-        application = QtWidgets.QApplication([])
-    widget = CameraAcquisitionWidget(prefix)
+    """Show a RedSun-composed client without creating SDK/MMCore objects."""
+    from typing import cast
+
+    from redsun.containers import declare_view
+    from redsun.qt import QtAppContainer
+
+    from redsun_aht.configurations.profiles import profile_path
+
+    class AHTCameraContainer(QtAppContainer, config=profile_path("camera-gui")):
+        camera_view = declare_view(CameraAcquisitionWidget, prefix=prefix)
+
+    container = AHTCameraContainer(
+        session="AHT camera acquisition", frontend="pyqt"
+    ).build()
+    widget = cast("CameraAcquisitionWidget", container.views["camera_view"])
+    widget._redsun_container = container  # type: ignore[attr-defined]
     widget.show()
     if run_event_loop:
-        application.exec()
+        application = QtWidgets.QApplication.instance()
+        if not isinstance(application, QtWidgets.QApplication):
+            raise RuntimeError("RedSun Qt container did not create QApplication")
+        try:
+            application.exec()
+        finally:
+            container.shutdown()
     return widget
 
 

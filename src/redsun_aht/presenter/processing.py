@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Literal
+
+import dependency_injector.providers as dip
+from redsun.presenter import Presenter
 
 from redsun_aht.processing import (
     OfflineMultiLayerJobRequest,
@@ -21,6 +24,8 @@ if TYPE_CHECKING:
     from collections.abc import Mapping
 
     import numpy.typing as npt
+    from ophyd_async.core import Device
+    from redsun.virtual import ProviderKey, VirtualContainer
 
     from redsun_aht.processing import ProcessingBatchResult
 
@@ -43,13 +48,26 @@ class ProcessingViewResult:
         object.__setattr__(self, "failures", MappingProxyType(dict(self.failures)))
 
 
-@dataclass(slots=True)
-class OfflineProcessingPresenter:
+class OfflineProcessingPresenter(Presenter):
     """Resolve, preview, execute, and verify processing without hardware."""
 
-    executable: str = "aht"
-    last_plan: OfflineProcessingPlan | None = field(default=None, init=False)
-    last_result: ProcessingViewResult | None = field(default=None, init=False)
+    def __init__(
+        self,
+        name: str = "offline-processing",
+        devices: Mapping[str, Device] | None = None,
+        /,
+        *,
+        executable: str = "aht",
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(name, {} if devices is None else devices, **kwargs)
+        self.executable = executable
+        self.last_plan: OfflineProcessingPlan | None = None
+        self.last_result: ProcessingViewResult | None = None
+
+    def register_providers(self, container: VirtualContainer) -> None:
+        """Publish this hardware-free processing boundary to RedSun views."""
+        container.provide(OFFLINE_PROCESSING_PRESENTER, self)
 
     def resolve(
         self,
@@ -91,11 +109,16 @@ class OfflineProcessingPresenter:
 
     def execute(self, plan: OfflineProcessingPlan) -> ProcessingViewResult:
         """Run the resolved plan and verify every published product for display."""
-        batch = run_offline_processing_plan(plan)
+        batch = self.execute_batch(plan)
         result = self._to_view_result(plan, batch)
-        self.last_plan = plan
         self.last_result = result
         return result
+
+    def execute_batch(self, plan: OfflineProcessingPlan) -> ProcessingBatchResult:
+        """Execute a detached batch for a headless RedSun application."""
+        batch = run_offline_processing_plan(plan)
+        self.last_plan = plan
+        return batch
 
     @staticmethod
     def _to_view_result(
@@ -117,4 +140,12 @@ class OfflineProcessingPresenter:
         )
 
 
-__all__ = ["OfflineProcessingPresenter", "ProcessingViewResult"]
+OFFLINE_PROCESSING_PRESENTER: ProviderKey[OfflineProcessingPresenter] = dip.Dependency(
+    instance_of=OfflineProcessingPresenter
+)
+
+__all__ = [
+    "OFFLINE_PROCESSING_PRESENTER",
+    "OfflineProcessingPresenter",
+    "ProcessingViewResult",
+]

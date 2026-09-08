@@ -10,6 +10,7 @@ import pytest
 import zarr
 
 from redsun_aht.configurations import build_dpct_simulation
+from redsun_aht.domain import MultiSliceAcquisitionMode
 from redsun_aht.domain.models import thaw_json
 from redsun_aht.processing import (
     MultiLayerProcessingRequest,
@@ -89,9 +90,10 @@ def test_multilayer_job_runs_in_spawned_worker_with_verified_provenance(
     provenance = cast("dict[str, object]", aht["provenance"])
     donor = cast("dict[str, object]", provenance["donor"])
     source = cast("dict[str, object]", provenance["source"])
-    assert donor["commit"] == "e8dd96bfa2d54784e00209769d594f305863b01a"
+    assert donor["version"] == "2025-08-16"
+    assert donor["license"] == "BSD-3-Clause"
     assert source["sample_detector_id"] == "dhm"
-    assert provenance["scientific_status"] == "donor-characterized-cpu-reference"
+    assert provenance["scientific_status"] == "cropped-40um-phantom-convergence-tested"
     assert len(cast("list[float]", provenance["loss_history"])) == 1
 
     replayed = run_multilayer_processing_plan(plan)
@@ -205,6 +207,23 @@ def test_reconstruction_config_rejects_invalid_values(
 ) -> None:
     with pytest.raises(ValueError, match=message):
         _reconstruction(**updates)
+
+
+def test_reconstruction_config_requires_interferometric_tag_for_refocusing() -> None:
+    with pytest.raises(ValueError, match="does not use numerical refocusing"):
+        _reconstruction(
+            acquisition_mode=MultiSliceAcquisitionMode.AHT_REAL_AMPLITUDE_FOCAL_STACK,
+            focus_offsets_slices=(-1.0, 0.0, 1.0),
+        )
+
+    config = _reconstruction(
+        acquisition_mode=MultiSliceAcquisitionMode.INTERFEROMETRIC_COMPLEX_FIELD,
+        focus_offsets_slices=(-1.0, 0.0, 1.0),
+    )
+    assert (
+        config.acquisition_mode
+        is MultiSliceAcquisitionMode.INTERFEROMETRIC_COMPLEX_FIELD
+    )
 
 
 def test_multilayer_kernel_rejects_changed_resource_preflight(tmp_path: Path) -> None:

@@ -6,9 +6,9 @@ from dataclasses import dataclass
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, cast
 
-from bluesky import RunEngine
 from bluesky import plan_stubs as bps
 from bluesky import preprocessors as bpp
+from redsun.engine import RunEngine
 
 from redsun_aht.acquisition import DocumentRecord
 from redsun_aht.device.processing import ProcessingFlyerDevice
@@ -80,7 +80,7 @@ class ProcessingFlyerReplay:
             documents.append(item)
 
         engine = RunEngine({})
-        engine(self.plan(), record)
+        engine(self.plan(), record).result()
         results = {
             flyer.worker.solver_id: flyer.result
             for flyer in self.flyers

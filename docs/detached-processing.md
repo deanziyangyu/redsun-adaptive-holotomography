@@ -4,6 +4,11 @@ Phase 4 begins with a hardware-free processing boundary. It accepts only
 committed references from a verified DPCT run bundle and never constructs a
 detector, stage, MCU, IOC, or MMCore instance.
 
+`process-headless` builds the packaged hardware-free RedSun application
+profile and executes the detached batch through its processing presenter. The
+worker module remains AHT-specific; RedSun owns its application composition
+and lifecycle.
+
 ## Process topology
 
 `ProcessingSupervisor` owns one persistent spawned process per solver ID. The
@@ -141,9 +146,10 @@ The optional Qt/Napari MVP resolves an `OfflineProcessingRequest` into the same
 typed `ProcessingJob` objects before it displays or copies an equivalent
 headless command. Its optional tiled quantitative group exposes the model,
 sample/background selection, optics, regularization, and deterministic XY
-tiling controls. A separate nonlinear group exposes multi-layer Born/multislice
-geometry, optics, source plane, normalization, iterative controls, and its own
-CPU/GPU placement. Its Run action executes that already-resolved plan through
+tiling controls. A separate nonlinear group exposes multi-layer Born or the
+replacement defocus-diverse multislice geometry, optics, source plane,
+normalization, iterative controls, and its own CPU/GPU placement. Its Run action
+executes that already-resolved plan through
 the same supervisor and checksum-verifies published arrays before presenting
 them as Napari image layers. The GUI composition imports no acquisition device
 module and constructs no detector, stage, MCU, IOC, or MMCore object. See

@@ -12,6 +12,7 @@ from redsun_aht.catalog import connect_tiled, register_processing_run
 from redsun_aht.configurations import (
     PROFILES,
     build_simulated_mcu_test_session,
+    profile_metadata,
     run_camera_acquisition_gui,
     run_dpct_simulation,
     run_dual_detector_simulation,
@@ -21,6 +22,7 @@ from redsun_aht.configurations import (
     run_simulation,
 )
 from redsun_aht.device.mcu import McuCommandFailure
+from redsun_aht.domain import MultiSliceAcquisitionMode
 from redsun_aht.mcu import HUMAN_MCU_COMMAND_HELP, HumanMcuCommandError
 from redsun_aht.processing import (
     MultiLayerReconstructionConfig,
@@ -233,6 +235,15 @@ def _add_multilayer_processing_arguments(parser: argparse.ArgumentParser) -> Non
     parser.add_argument("--multilayer-na", type=float)
     parser.add_argument("--multilayer-medium-index", type=float, default=1.33)
     parser.add_argument("--multilayer-illumination-na", type=float)
+    parser.add_argument(
+        "--multilayer-acquisition-mode",
+        choices=tuple(mode.value for mode in MultiSliceAcquisitionMode),
+        default=MultiSliceAcquisitionMode.AHT_REAL_AMPLITUDE_FOCAL_STACK.value,
+        help=(
+            "measurement contract: AHT real-amplitude focal stack or "
+            "interferometric complex field"
+        ),
+    )
     parser.add_argument("--multilayer-source-z-index", type=int, default=0)
     parser.add_argument(
         "--multilayer-padding-yx",
@@ -242,6 +253,17 @@ def _add_multilayer_processing_arguments(parser: argparse.ArgumentParser) -> Non
         default=(0, 0),
     )
     parser.add_argument("--multilayer-defocus-um", type=float, default=0.0)
+    parser.add_argument(
+        "--multilayer-focus-offset-slices", type=float, nargs="+", default=(0.0,)
+    )
+    parser.add_argument(
+        "--multilayer-illumination-fxy",
+        type=float,
+        nargs=2,
+        action="append",
+        metavar=("FX", "FY"),
+    )
+    parser.add_argument("--multilayer-skip-shots", type=int, nargs="*", default=())
     parser.add_argument(
         "--multilayer-normalization",
         choices=("none", "shot_mean", "background"),
@@ -271,6 +293,8 @@ def _add_multilayer_processing_arguments(parser: argparse.ArgumentParser) -> Non
     parser.add_argument("--multilayer-l2-weight", type=float, default=0.0)
     parser.add_argument("--multilayer-tv-weight", type=float, default=0.0)
     parser.add_argument("--multilayer-tv-iterations", type=int, default=15)
+    parser.add_argument("--multilayer-early-stopping-relative", type=float)
+    parser.add_argument("--multilayer-subtract-first-slice-mean", action="store_true")
     parser.add_argument(
         "--no-multilayer-enforce-physical-sign",
         dest="multilayer_enforce_physical_sign",
@@ -377,6 +401,8 @@ def _multilayer_request_from_args(
         recover_pupil=args.multilayer_recover_pupil,
         pupil_step_size=args.multilayer_pupil_step_size,
         pupil_update_method=args.multilayer_pupil_update_method,
+        early_stopping_relative=args.multilayer_early_stopping_relative,
+        subtract_first_slice_mean=args.multilayer_subtract_first_slice_mean,
     )
     reconstruction = MultiLayerReconstructionConfig(
         model=args.multilayer_model,
@@ -386,9 +412,17 @@ def _multilayer_request_from_args(
         numerical_aperture=args.multilayer_na,
         refractive_index_medium=args.multilayer_medium_index,
         illumination_na=args.multilayer_illumination_na,
+        acquisition_mode=MultiSliceAcquisitionMode(args.multilayer_acquisition_mode),
         source_z_index=args.multilayer_source_z_index,
         padding_yx=tuple(args.multilayer_padding_yx),
         defocus_um=args.multilayer_defocus_um,
+        focus_offsets_slices=tuple(args.multilayer_focus_offset_slices),
+        illumination_fxy=(
+            None
+            if args.multilayer_illumination_fxy is None
+            else tuple(tuple(pair) for pair in args.multilayer_illumination_fxy)
+        ),
+        skip_shots=tuple(args.multilayer_skip_shots),
         normalization=args.multilayer_normalization,
         solve=solve,
         memory_budget_bytes=args.multilayer_memory_budget_mib * 1024 * 1024,
@@ -409,7 +443,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
     if args.command == "profiles":
         for profile in PROFILES.values():
-            print(f"{profile.name}: {profile.description}")
+            metadata = profile_metadata(profile)
+            print(f"{metadata['profile']}: {metadata['description']}")
         return 0
     if args.command == "simulate":
         snapshot = run_simulation(args.journal)

@@ -6,6 +6,8 @@ from dataclasses import dataclass
 from typing import Protocol
 
 from qtpy import QtCore, QtWidgets
+from redsun.view import ViewPosition
+from redsun.view.qt import QtView
 
 
 @dataclass(frozen=True, slots=True)
@@ -71,16 +73,25 @@ class _ScanTask(QtCore.QRunnable):
             self.signals.failed.emit(f"{type(error).__name__}: {error}")
 
 
-class MultishotScanWidget(QtWidgets.QWidget):
+class MultishotScanWidget(QtView):
     """User-operable finite-scan panel with no implicit hardware construction."""
 
     def __init__(
         self,
-        client: MultishotScanClient,
+        name: str | MultishotScanClient,
+        /,
         *,
+        client: MultishotScanClient | None = None,
         parent: QtWidgets.QWidget | None = None,
     ) -> None:
-        super().__init__(parent)
+        if not isinstance(name, str):
+            client = name
+            name = "multishot-scan"
+        if client is None:
+            raise ValueError("multishot scan view requires a composed client")
+        super().__init__(name)
+        if parent is not None:
+            self.setParent(parent)
         self.client = client
         self._task: _ScanTask | None = None
         thread_pool = QtCore.QThreadPool.globalInstance()
@@ -88,6 +99,11 @@ class MultishotScanWidget(QtWidgets.QWidget):
             raise RuntimeError("Qt global thread pool is unavailable")
         self._thread_pool: QtCore.QThreadPool = thread_pool
         self._build_ui()
+
+    @property
+    def view_position(self) -> ViewPosition:
+        """Place finite-scan controls beside the acquisition workspace."""
+        return ViewPosition.RIGHT
 
     def _build_ui(self) -> None:
         self.setWindowTitle("AHT four-shot list scan")

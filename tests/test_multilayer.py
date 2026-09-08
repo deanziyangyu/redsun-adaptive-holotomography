@@ -58,12 +58,12 @@ def _fixture() -> tuple[MultiLayerConfig, np.ndarray[Any, Any], np.ndarray[Any, 
         ),
         (
             "multislice",
-            -0.9975217 + 0.08694608j,
-            -0.8055267 + 0.56251407j,
-            -0.19478186964988708 - 0.20140528678894043j,
-            -0.0008141917,
-            0.2305813729763031,
-            0.003994406200945377,
+            -0.74202794 - 0.66661644j,
+            0.749692 - 0.6484429j,
+            0.40540814 - 0.48028603j,
+            -0.0049758698,
+            0.2300554663,
+            0.007967415265738964,
         ),
     ],
 )
@@ -121,6 +121,13 @@ def test_model_gradient_matches_central_difference(
     )
     direction = gradient / np.linalg.norm(gradient)
     analytic = float(np.sum(gradient * direction))
+    # The MATLAB BPM_update convention omits the obliquity multiplier from
+    # the update and reports ||residual||^2 rather than half that value.
+    derivative_scale = (
+        2.0 * model.illumination_obliquity(*frequencies[0])
+        if isinstance(model, MultiSliceModel)
+        else 1.0
+    )
 
     plus = model.loss_and_gradient(
         native + epsilon * direction,
@@ -135,7 +142,11 @@ def test_model_gradient_matches_central_difference(
         measurement_domain="amplitude",
     )[0]
 
-    np.testing.assert_allclose((plus - minus) / (2 * epsilon), analytic, rtol=5e-3)
+    np.testing.assert_allclose(
+        (plus - minus) / (2 * epsilon),
+        derivative_scale * analytic,
+        rtol=5e-3,
+    )
 
 
 @pytest.mark.parametrize("model_name", ["multi_born", "multislice"])
@@ -213,7 +224,7 @@ def test_memory_estimates_and_ring_geometry_are_deterministic() -> None:
     )
 
     assert model.estimated_cache_bytes() == 6720
-    assert model.estimated_working_set_bytes(4) == 39600
+    assert model.estimated_working_set_bytes(4) == 37360
     np.testing.assert_allclose(np.linalg.norm(frequencies, axis=1), 0.72)
     np.testing.assert_allclose(frequencies[0], [0.72, 0.0], atol=1e-15)
 

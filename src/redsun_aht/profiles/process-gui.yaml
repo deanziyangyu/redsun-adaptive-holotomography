@@ -1,0 +1,18 @@
+schema_version: 1.0
+frontend: pyqt
+session: AHT offline processing
+metadata:
+  profile: process-gui
+  description: hardware-free RedSun Qt/Napari processing application
+  constructs_hardware: false
+  devices: []
+devices: {}
+presenters:
+  processing:
+    plugin_name: redsun-aht
+    plugin_id: offline-processing
+views:
+  processing_view:
+    plugin_name: redsun-aht
+    plugin_id: processing
+wiring: []

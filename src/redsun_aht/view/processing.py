@@ -5,8 +5,15 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any, Literal, cast
 
 from qtpy import QtCore, QtWidgets
+from redsun.view import ViewPosition
+from redsun.view.qt import QtView
 
-from redsun_aht.presenter import OfflineProcessingPresenter, ProcessingViewResult
+from redsun_aht.domain import MultiSliceAcquisitionMode
+from redsun_aht.presenter import (
+    OFFLINE_PROCESSING_PRESENTER,
+    OfflineProcessingPresenter,
+    ProcessingViewResult,
+)
 from redsun_aht.processing import (
     MultiLayerReconstructionConfig,
     MultiLayerSolveConfig,
@@ -17,6 +24,8 @@ from redsun_aht.processing import (
 )
 
 if TYPE_CHECKING:
+    from redsun.virtual import VirtualContainer
+
     from redsun_aht.processing import OfflineProcessingPlan
 
 
@@ -44,18 +53,25 @@ class _ProcessingRunner(QtCore.QRunnable):
             self.signals.succeeded.emit(result)
 
 
-class ProcessingWidget(QtWidgets.QWidget):
+class ProcessingWidget(QtView):
     """Small processing-only form with no acquisition device dependencies."""
 
     def __init__(
         self,
-        presenter: OfflineProcessingPresenter,
+        name: str | OfflineProcessingPresenter = "processing",
+        /,
         *,
+        presenter: OfflineProcessingPresenter | None = None,
         viewer: Any | None = None,
         parent: QtWidgets.QWidget | None = None,
     ) -> None:
-        super().__init__(parent)
-        self.presenter = presenter
+        if isinstance(name, OfflineProcessingPresenter):
+            presenter = name
+            name = "processing"
+        super().__init__(name)
+        if parent is not None:
+            self.setParent(parent)
+        self._presenter = presenter
         self.viewer = viewer
         thread_pool = QtCore.QThreadPool.globalInstance()
         if thread_pool is None:  # pragma: no cover - Qt runtime invariant
@@ -63,6 +79,25 @@ class ProcessingWidget(QtWidgets.QWidget):
         self._thread_pool: QtCore.QThreadPool = thread_pool
         self._runner: _ProcessingRunner | None = None
         self._build_ui()
+
+    @property
+    def view_position(self) -> ViewPosition:
+        """Place the AHT processing controls beside the image workspace."""
+        return ViewPosition.RIGHT
+
+    @property
+    def presenter(self) -> OfflineProcessingPresenter:
+        """Return the injected RedSun presenter."""
+        if self._presenter is None:
+            raise RuntimeError(
+                "processing presenter is available after container build"
+            )
+        return self._presenter
+
+    def inject_dependencies(self, container: VirtualContainer) -> None:
+        """Resolve the processing presenter from the RedSun container."""
+        if self._presenter is None:
+            self._presenter = container.require(OFFLINE_PROCESSING_PRESENTER)
 
     def _build_ui(self) -> None:
         layout = QtWidgets.QVBoxLayout(self)
@@ -254,10 +289,16 @@ class ProcessingWidget(QtWidgets.QWidget):
         self.multilayer_na = self._positive_float(0.8, 6)
         self.multilayer_medium_index = self._positive_float(1.33, 6)
         self.multilayer_illumination_na = self._positive_float(0.45, 6)
+        self.multilayer_acquisition_mode = QtWidgets.QComboBox()
+        self.multilayer_acquisition_mode.addItems(
+            [mode.value for mode in MultiSliceAcquisitionMode]
+        )
         self.multilayer_source_z = QtWidgets.QSpinBox()
         self.multilayer_source_z.setRange(0, 1_000_000)
         self.multilayer_padding = QtWidgets.QLineEdit("0, 0")
         self.multilayer_defocus = self._float(0.0, -1_000_000.0, 1_000_000.0, 6)
+        self.multilayer_focus_offsets = QtWidgets.QLineEdit("0")
+        self.multilayer_skip_shots = QtWidgets.QLineEdit()
         self.multilayer_normalization = QtWidgets.QComboBox()
         self.multilayer_normalization.addItems(("shot_mean", "background", "none"))
         self.multilayer_memory_budget = QtWidgets.QSpinBox()
@@ -269,9 +310,12 @@ class ProcessingWidget(QtWidgets.QWidget):
         form.addRow("Detection NA", self.multilayer_na)
         form.addRow("Medium refractive index", self.multilayer_medium_index)
         form.addRow("Illumination NA", self.multilayer_illumination_na)
+        form.addRow("Acquisition mode", self.multilayer_acquisition_mode)
         form.addRow("Source acquisition Z index", self.multilayer_source_z)
         form.addRow("Padding Y, X", self.multilayer_padding)
         form.addRow("Defocus (um)", self.multilayer_defocus)
+        form.addRow("MSBP focus offsets (slices)", self.multilayer_focus_offsets)
+        form.addRow("MSBP skipped shots (zero-based)", self.multilayer_skip_shots)
         form.addRow("Normalization", self.multilayer_normalization)
         form.addRow("CPU memory budget (MiB)", self.multilayer_memory_budget)
 
@@ -288,6 +332,10 @@ class ProcessingWidget(QtWidgets.QWidget):
         self.multilayer_tv_iterations = QtWidgets.QSpinBox()
         self.multilayer_tv_iterations.setRange(1, 1_000_000)
         self.multilayer_tv_iterations.setValue(15)
+        self.multilayer_early_stopping = self._float(0.0, 0.0, 1_000_000.0, 9)
+        self.multilayer_subtract_first_slice_mean = QtWidgets.QCheckBox(
+            "Subtract first-slice mean"
+        )
         self.multilayer_recover_pupil = QtWidgets.QCheckBox("Recover pupil")
         self.multilayer_pupil_step = self._float(0.0, 0.0, 1_000_000.0, 9)
         self.multilayer_pupil_method = QtWidgets.QComboBox()
@@ -299,6 +347,13 @@ class ProcessingWidget(QtWidgets.QWidget):
         form.addRow("L2 weight", self.multilayer_l2)
         form.addRow("TV weight", self.multilayer_tv)
         form.addRow("TV iterations", self.multilayer_tv_iterations)
+        form.addRow(
+            "Early stop relative change (0 = off)",
+            self.multilayer_early_stopping,
+        )
+        form.addRow(
+            "MSBP baseline correction", self.multilayer_subtract_first_slice_mean
+        )
         form.addRow("Pupil", self.multilayer_recover_pupil)
         form.addRow("Pupil step size", self.multilayer_pupil_step)
         form.addRow("Pupil update", self.multilayer_pupil_method)
@@ -434,6 +489,22 @@ class ProcessingWidget(QtWidgets.QWidget):
                 "multi-layer background Z index must be an integer"
             ) from error
         step_value = self.multilayer_step.value()
+        focus_offsets = tuple(
+            float(part.strip())
+            for part in self.multilayer_focus_offsets.text().split(",")
+            if part.strip()
+        )
+        try:
+            skip_shots = tuple(
+                int(part.strip())
+                for part in self.multilayer_skip_shots.text().split(",")
+                if part.strip()
+            )
+        except ValueError as error:
+            raise ValueError(
+                "MSBP skipped shots must be comma-separated integers"
+            ) from error
+        early_stopping = self.multilayer_early_stopping.value()
         solve = MultiLayerSolveConfig(
             max_iterations=self.multilayer_iterations.value(),
             step_size=None if step_value == 0 else step_value,
@@ -454,6 +525,10 @@ class ProcessingWidget(QtWidgets.QWidget):
                 "Literal['gradient', 'gauss_newton']",
                 self.multilayer_pupil_method.currentText(),
             ),
+            early_stopping_relative=(None if early_stopping == 0 else early_stopping),
+            subtract_first_slice_mean=(
+                self.multilayer_subtract_first_slice_mean.isChecked()
+            ),
         )
         reconstruction = MultiLayerReconstructionConfig(
             model=cast(
@@ -466,9 +541,14 @@ class ProcessingWidget(QtWidgets.QWidget):
             numerical_aperture=self.multilayer_na.value(),
             refractive_index_medium=self.multilayer_medium_index.value(),
             illumination_na=self.multilayer_illumination_na.value(),
+            acquisition_mode=MultiSliceAcquisitionMode(
+                self.multilayer_acquisition_mode.currentText()
+            ),
             source_z_index=self.multilayer_source_z.value(),
             padding_yx=padding,
             defocus_um=self.multilayer_defocus.value(),
+            focus_offsets_slices=focus_offsets,
+            skip_shots=skip_shots,
             normalization=cast(
                 "Literal['none', 'shot_mean', 'background']",
                 self.multilayer_normalization.currentText(),
@@ -601,19 +681,37 @@ def launch_processing_gui(
     output_root: str | None = None,
     run_event_loop: bool = True,
 ) -> tuple[Any, ProcessingWidget]:
-    """Create the Napari processing-only application and optionally run it."""
+    """Create the RedSun-composed Napari application and optionally run it."""
     import napari
+    from redsun.containers import declare_presenter, declare_view
+    from redsun.qt import QtAppContainer
+
+    from redsun_aht.configurations.profiles import profile_path
 
     active_presenter = presenter or OfflineProcessingPresenter()
     viewer = napari.Viewer(title="RedSun AHT Offline Processing")
-    widget = ProcessingWidget(active_presenter, viewer=viewer)
+
+    class AHTProcessingContainer(QtAppContainer, config=profile_path("process-gui")):
+        processing = declare_presenter(
+            OfflineProcessingPresenter, executable=active_presenter.executable
+        )
+        processing_view = declare_view(ProcessingWidget, viewer=viewer)
+
+    container = AHTProcessingContainer(
+        session="AHT offline processing", frontend="pyqt"
+    ).build()
+    widget = cast("ProcessingWidget", container.views["processing_view"])
+    widget._redsun_container = container  # type: ignore[attr-defined]
     if input_root is not None:
         widget.input_edit.setText(input_root)
     if output_root is not None:
         widget.output_edit.setText(output_root)
     viewer.window.add_dock_widget(widget, name="AHT Processing", area="right")
     if run_event_loop:
-        napari.run()
+        try:
+            napari.run()
+        finally:
+            container.shutdown()
     return viewer, widget
 
 

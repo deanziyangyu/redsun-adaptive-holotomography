@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING, Literal, cast
 
 import numpy as np
 
-from redsun_aht.domain import ProcessingJob
+from redsun_aht.domain import MultiSliceAcquisitionMode, ProcessingJob
 from redsun_aht.processing.multilayer import (
     ModelName,
     MultiLayerConfig,
@@ -46,15 +46,26 @@ class MultiLayerReconstructionConfig:
     numerical_aperture: float
     refractive_index_medium: float
     illumination_na: float
+    acquisition_mode: MultiSliceAcquisitionMode = (
+        MultiSliceAcquisitionMode.AHT_REAL_AMPLITUDE_FOCAL_STACK
+    )
     source_z_index: int = 0
     padding_yx: tuple[int, int] = (0, 0)
     defocus_um: float = 0.0
+    focus_offsets_slices: tuple[float, ...] = (0.0,)
+    illumination_fxy: tuple[tuple[float, float], ...] | None = None
+    skip_shots: tuple[int, ...] = ()
     normalization: MeasurementNormalization = "shot_mean"
     solve: MultiLayerSolveConfig = field(default_factory=MultiLayerSolveConfig)
     memory_budget_bytes: int = 512 * 1024 * 1024
 
     def __post_init__(self) -> None:
         """Validate inputs that do not depend on the selected observation."""
+        try:
+            acquisition_mode = MultiSliceAcquisitionMode(self.acquisition_mode)
+        except (TypeError, ValueError) as error:
+            raise ValueError("multi-slice acquisition mode is unsupported") from error
+        object.__setattr__(self, "acquisition_mode", acquisition_mode)
         if self.model not in {"multi_born", "multislice"}:
             raise ValueError("multi-layer reconstruction model is unsupported")
         if type(self.depth_layers) is not int or self.depth_layers <= 0:
@@ -69,6 +80,36 @@ class MultiLayerReconstructionConfig:
             raise ValueError("multi-layer illumination NA is invalid")
         if self.normalization not in {"none", "shot_mean", "background"}:
             raise ValueError("multi-layer normalization is unsupported")
+        if not self.focus_offsets_slices or any(
+            not np.isfinite(value) for value in self.focus_offsets_slices
+        ):
+            raise ValueError("multi-layer focus offsets must be non-empty and finite")
+        if self.model != "multislice" and self.focus_offsets_slices != (0.0,):
+            raise ValueError("focus diversity is available only for multislice")
+        if (
+            self.model == "multislice"
+            and acquisition_mode
+            is MultiSliceAcquisitionMode.AHT_REAL_AMPLITUDE_FOCAL_STACK
+            and self.focus_offsets_slices != (0.0,)
+        ):
+            raise ValueError(
+                "AHT focal-stack acquisition does not use numerical refocusing"
+            )
+        if self.illumination_fxy is not None and any(
+            len(pair) != 2 or not all(np.isfinite(value) for value in pair)
+            for pair in self.illumination_fxy
+        ):
+            raise ValueError("explicit illuminations must contain finite FX,FY pairs")
+        if len(set(self.skip_shots)) != len(self.skip_shots) or any(
+            type(index) is not int or index < 0 for index in self.skip_shots
+        ):
+            raise ValueError("skipped shots must be unique zero-based indices")
+        if self.model != "multislice" and self.skip_shots:
+            raise ValueError("skipped shots are available only for multislice")
+        if self.model == "multislice" and self.solve.recover_pupil:
+            raise ValueError(
+                "the current multislice model does not support pupil recovery"
+            )
         if (
             type(self.memory_budget_bytes) is not int
             or self.memory_budget_bytes <= 0
@@ -89,6 +130,7 @@ class MultiLayerReconstructionConfig:
             self.refractive_index_medium,
             padding_yx=self.padding_yx,
             defocus_um=self.defocus_um,
+            allow_evanescent_pupil=self.model == "multislice",
         )
 
 
@@ -218,7 +260,12 @@ def resolve_multilayer_processing(
     model_config = request.reconstruction.model_config((ny, nx))
     model = create_multilayer_model(request.reconstruction.model, model_config)
     estimate = model.estimated_working_set_bytes(shots)
-    estimate += 2 * shots * ny * nx * np.dtype(np.complex64).itemsize
+    retained_planes = (
+        len(request.reconstruction.focus_offsets_slices)
+        if request.reconstruction.model == "multislice"
+        else 1
+    )
+    estimate += 2 * shots * retained_planes * ny * nx * np.dtype(np.complex64).itemsize
     budget = (
         request.reconstruction.memory_budget_bytes
         if request.backend == "numpy"
@@ -228,11 +275,20 @@ def resolve_multilayer_processing(
         raise MemoryError(
             f"multi-layer working-set estimate {estimate} exceeds budget {budget}"
         )
-    frequencies = ring_illumination_frequencies(
-        shots,
-        wavelength_um=request.reconstruction.wavelength_um,
-        illumination_na=request.reconstruction.illumination_na,
-    )
+    if request.reconstruction.illumination_fxy is None:
+        frequencies = ring_illumination_frequencies(
+            shots,
+            wavelength_um=request.reconstruction.wavelength_um,
+            illumination_na=request.reconstruction.illumination_na,
+        )
+    else:
+        frequencies = np.asarray(
+            request.reconstruction.illumination_fxy, dtype=np.float64
+        )
+        if frequencies.shape != (shots, 2):
+            raise ValueError("explicit illuminations must match the shot axis")
+    if any(index >= shots for index in request.reconstruction.skip_shots):
+        raise ValueError("skipped shot index is out of range")
     solver_id = f"multilayer-{request.reconstruction.model}-{request.backend}"
     configuration = cast(
         "dict[str, JsonValue]",
@@ -255,7 +311,9 @@ def resolve_multilayer_processing(
     job = ProcessingJob(
         job_id=f"{sample.run_id}-{solver_id}-{sample.detector_id}",
         solver_id=solver_id,
-        solver_version="1.0.0",
+        solver_version=(
+            "2.0.0" if request.reconstruction.model == "multislice" else "1.0.0"
+        ),
         input_selectors=tuple(item.observation_id for item in selected),
         configuration=configuration,
         priority=0,

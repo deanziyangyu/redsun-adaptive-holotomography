@@ -13,6 +13,7 @@ if TYPE_CHECKING:
     from redsun_aht.processing.multilayer import (
         BaseMultiLayerModel,
         MeasurementDomain,
+        MultiSliceModel,
     )
 
 OptimizerName = Literal["fista", "gradient_descent"]
@@ -43,6 +44,8 @@ class MultiLayerSolveConfig:
     recover_pupil: bool = False
     pupil_step_size: float = 0.0
     pupil_update_method: PupilUpdateMethod = "gradient"
+    early_stopping_relative: float | None = None
+    subtract_first_slice_mean: bool = False
 
     def __post_init__(self) -> None:
         """Reject non-deterministic or numerically invalid solver inputs."""
@@ -71,6 +74,11 @@ class MultiLayerSolveConfig:
             raise ValueError("pupil recovery requires a positive pupil step size")
         if self.pupil_update_method not in {"gradient", "gauss_newton"}:
             raise ValueError("multi-layer pupil update method is unsupported")
+        if self.early_stopping_relative is not None and (
+            not np.isfinite(self.early_stopping_relative)
+            or self.early_stopping_relative <= 0
+        ):
+            raise ValueError("multi-layer early stopping must be finite and positive")
 
 
 @dataclass(frozen=True, slots=True)
@@ -149,6 +157,16 @@ def solve_multilayer(
     check_cancelled: Callable[[], None] = lambda: None,
 ) -> MultiLayerSolveResult:
     """Run deterministic sequential-shot gradient or FISTA reconstruction."""
+    if model.model_name == "multislice":
+        return solve_multislice(
+            model,  # type: ignore[arg-type]
+            measurements_syx,
+            illumination_fxy,
+            (0.0,),
+            (),
+            config,
+            check_cancelled=check_cancelled,
+        )
     xp = model.xp
     measurements = xp.asarray(measurements_syx)
     frequencies = np.asarray(illumination_fxy, dtype=np.float64)
@@ -270,6 +288,174 @@ def solve_multilayer(
     )
 
 
+def solve_multislice(
+    model: MultiSliceModel,
+    measurements_syx: Any,
+    illumination_fxy: Any,
+    focus_offsets_slices: tuple[float, ...],
+    skip_shots: tuple[int, ...],
+    config: MultiLayerSolveConfig,
+    *,
+    initial_native_zyx: Any | None = None,
+    check_cancelled: Callable[[], None] = lambda: None,
+) -> MultiLayerSolveResult:
+    """Run the 2025 angle/defocus-diverse MSBP inverse solver.
+
+    Raw complex fields are digitally refocused before optimization. Real
+    measurements can be used only at a zero focus offset because phase is
+    required to synthesize other planes.
+    """
+    if config.recover_pupil:
+        raise ValueError("the 2025 MSBP solver does not recover the pupil")
+    xp = model.xp
+    raw = xp.asarray(measurements_syx)
+    frequencies = np.asarray(illumination_fxy, dtype=np.float64)
+    shots = int(raw.shape[0]) if raw.ndim == 3 else 0
+    if (
+        raw.ndim != 3
+        or shots <= 0
+        or raw.shape[1:] != model.shape_zyx[-2:]
+        or frequencies.shape != (shots, 2)
+        or not np.all(np.isfinite(frequencies))
+    ):
+        raise ValueError("MSBP measurements and illuminations require SYX and S,2")
+    if not focus_offsets_slices or any(
+        not np.isfinite(value) for value in focus_offsets_slices
+    ):
+        raise ValueError("MSBP focus offsets must be a non-empty finite sequence")
+    skipped = frozenset(skip_shots)
+    if any(type(index) is not int or not 0 <= index < shots for index in skipped):
+        raise ValueError("MSBP skipped shots must be unique zero-based indices")
+    included = np.asarray([index for index in range(shots) if index not in skipped])
+    if included.size == 0:
+        raise ValueError("MSBP cannot skip every illumination")
+    if not np.all(np.isfinite(_to_numpy(raw))):
+        raise ValueError("MSBP measurements must be finite")
+
+    domain: MeasurementDomain = config.measurement_domain
+    if np.issubdtype(raw.dtype, np.complexfloating):
+        refocused = model.refocus_measurements(
+            raw.astype(xp.complex64), frequencies, focus_offsets_slices
+        )
+        if domain == "amplitude":
+            prepared = xp.abs(refocused).astype(xp.float32)
+        elif domain == "intensity":
+            prepared = (xp.abs(refocused) ** 2).astype(xp.float32)
+        else:
+            prepared = refocused.astype(xp.complex64)
+    else:
+        if tuple(focus_offsets_slices) != (0.0,):
+            raise ValueError("MSBP digital refocusing requires complex input fields")
+        if domain == "field":
+            raise ValueError("MSBP field-domain reconstruction requires complex fields")
+        if bool(xp.any(raw < 0).item()):
+            raise ValueError(f"MSBP {domain} measurements cannot be negative")
+        prepared = raw[:, None, ...].astype(xp.float32)
+
+    if initial_native_zyx is None:
+        native = xp.zeros(model.shape_zyx, dtype=xp.float32)
+    else:
+        native = xp.asarray(initial_native_zyx, dtype=xp.float32)
+        if native.shape != model.shape_zyx or not np.all(
+            np.isfinite(_to_numpy(native))
+        ):
+            raise ValueError("MSBP initial object must match finite ZYX geometry")
+        native = model.project_native(native)
+    step_size = config.step_size if config.step_size is not None else 2e-4
+    random = np.random.default_rng(config.seed)
+    momentum_reference = native.copy()
+    accepted_native = native.copy()
+    t_value = 1.0
+    previous_cost: float | None = None
+    losses: list[float] = []
+    restarts: list[bool] = []
+
+    for _iteration in range(config.max_iterations):
+        check_cancelled()
+        order = random.permutation(included) if config.random_order else included
+        total_cost = 0.0
+        for focus_index, focus_offset in enumerate(focus_offsets_slices):
+            for shot_value in order:
+                check_cancelled()
+                shot = int(shot_value)
+                fx, fy = frequencies[shot]
+                cost, gradient, _ = model.loss_and_gradient_refocused(
+                    native,
+                    prepared[shot, focus_index],
+                    float(fx),
+                    float(fy),
+                    focus_offset,
+                    measurement_domain=domain,
+                )
+                total_cost += cost
+                native -= step_size * gradient
+            if config.tv_weight and focus_index < len(focus_offsets_slices) - 1:
+                native = prox_tv_chambolle_3d(
+                    native.real,
+                    config.tv_weight,
+                    max_iterations=config.tv_iterations,
+                    xp=xp,
+                    check_cancelled=check_cancelled,
+                )
+
+        if config.l2_weight:
+            native -= step_size * config.l2_weight * native
+        if config.subtract_first_slice_mean:
+            native -= xp.mean(native[0].real)
+        if config.enforce_physical_sign:
+            native = model.project_native(native)
+        else:
+            native = native.real.astype(xp.float32)
+        if config.tv_weight:
+            native = prox_tv_chambolle_3d(
+                native,
+                config.tv_weight,
+                max_iterations=config.tv_iterations,
+                xp=xp,
+                check_cancelled=check_cancelled,
+            )
+
+        restarted = False
+        if (
+            previous_cost is not None
+            and total_cost > previous_cost
+            and config.restart_on_loss_increase
+        ):
+            native = accepted_native.copy()
+            momentum_reference = accepted_native.copy()
+            t_value = 1.0
+            restarted = True
+        else:
+            proximal_native = native.copy()
+            accepted_native = proximal_native.copy()
+            if config.optimizer == "fista":
+                t_next = 0.5 * (1.0 + np.sqrt(1.0 + 4.0 * t_value**2))
+                beta = (t_value - 1.0) / t_next
+                native = proximal_native + beta * (proximal_native - momentum_reference)
+                momentum_reference = proximal_native
+                t_value = t_next
+            previous_cost = total_cost
+        losses.append(float(total_cost))
+        restarts.append(restarted)
+        if (
+            config.early_stopping_relative is not None
+            and len(losses) > 1
+            and abs(losses[-2] - losses[-1]) / max(abs(losses[-1]), np.finfo(float).eps)
+            < config.early_stopping_relative
+        ):
+            break
+
+    refractive_index = model.native_to_ri(accepted_native).astype(xp.float32)
+    return MultiLayerSolveResult(
+        refractive_index,
+        model.pupil.copy(),
+        tuple(losses),
+        tuple(float(step_size) for _ in losses),
+        tuple(restarts),
+        model.phase_change_per_slice(refractive_index),
+    )
+
+
 __all__ = [
     "MultiLayerSolveConfig",
     "MultiLayerSolveResult",
@@ -277,4 +463,5 @@ __all__ = [
     "PupilUpdateMethod",
     "prox_tv_chambolle_3d",
     "solve_multilayer",
+    "solve_multislice",
 ]

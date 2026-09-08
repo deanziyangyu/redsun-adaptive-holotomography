@@ -175,7 +175,9 @@ def test_dpct_replay_detects_array_tampering(tmp_path: Path) -> None:
 def test_dpct_failure_leaves_inspectable_incomplete_bundle(tmp_path: Path) -> None:
     output = tmp_path / "run-failed"
     simulation = build_dpct_simulation("run-failed", output_root=output)
-    first_detector = cast(Any, simulation.runner.detectors[0])
+    simulation.container.build()
+    detector_group = simulation.container.devices["detectors"]
+    first_detector = cast(Any, detector_group).detectors[0]
     first_detector._run_id = "wrong-run"
 
     with pytest.raises(RuntimeError, match="run identity"):

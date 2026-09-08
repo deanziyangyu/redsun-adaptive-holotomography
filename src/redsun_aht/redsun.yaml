@@ -1,4 +1,11 @@
-devices: {}
+devices:
+  dpct-stage: redsun_aht.device:DpctStageDevice
+  dpct-pattern: redsun_aht.device:DpctPatternDevice
+  dpct-detector-group: redsun_aht.device:DpctDetectorGroupDevice
 presenters:
   simulation-lifecycle: redsun_aht.presenter:SimulationLifecyclePresenter
-views: {}
+  offline-processing: redsun_aht.presenter:OfflineProcessingPresenter
+views:
+  camera-acquisition: redsun_aht.view.camera:CameraAcquisitionWidget
+  multishot-scan: redsun_aht.view.multishot:MultishotScanWidget
+  processing: redsun_aht.view.processing:ProcessingWidget

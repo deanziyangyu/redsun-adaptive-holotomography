@@ -1,0 +1,15 @@
+schema_version: 1.0
+frontend: headless
+session: AHT offline processing
+metadata:
+  profile: process-headless
+  description: hardware-free detached processing CLI
+  constructs_hardware: false
+  devices: []
+devices: {}
+presenters:
+  processing:
+    plugin_name: redsun-aht
+    plugin_id: offline-processing
+views: {}
+wiring: []

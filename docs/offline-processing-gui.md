@@ -3,6 +3,9 @@
 The processing GUI is an optional Qt/Napari application for replaying a
 completed, verified DPCT bundle. It is deliberately separate from acquisition:
 launching it constructs no detector, stage, MCU, camera IOC, or MMCore process.
+The application is composed by the `process-gui` RedSun profile: a RedSun
+presenter provides detached processing to an AHT-owned `QtView`, which is
+docked into the customized Napari workspace.
 
 ## Install and launch
 
@@ -55,19 +58,27 @@ reservation. This selection does not force the separate mean projection onto
 CUDA; if both GPU workers are enabled, normal exclusive admission requires
 different GPU IDs.
 
-Enabling **Optional nonlinear multi-layer job** adds multi-layer Born or
-multislice selection, one detector and acquisition Z plane, explicit output
+Enabling **Optional nonlinear multi-layer job** adds multi-layer Born or the
+replacement defocus-diverse multislice selection, one detector and acquisition
+Z plane, explicit output
 depth/voxel geometry, optics, illumination NA, normalization, iterative
 optimization, regularization, pupil recovery, CPU memory budget, and an
 independent CuPy placement. Background normalization requires an explicit
 second detector and background Z plane. The preview again contains every
 resolved typed value.
 
+The GUI exposes multislice focus offsets and zero-based skipped shots. Exact
+experimental illumination-frequency lists are currently a typed API/headless
+CLI input because hundreds of FX/FY pairs are not suitable for a form field.
+Pupil recovery is supported only by multi-layer Born and is rejected when the
+replacement multislice model is selected.
+
 ## Execution and presentation
 
 Run submits the resolved plan on the Qt global thread pool so the user
-interface remains responsive. The presenter uses the same detached supervisor
-as `process-headless`. For every successful product it resolves the local Zarr
+interface remains responsive. RedSun injects the presenter used by the view;
+the presenter uses the same detached supervisor as `process-headless`. For
+every successful product it resolves the local Zarr
 URI, reads the published array, and verifies its SHA-256 checksum before adding
 an image layer named `<source-run-id>:<solver-id>` to Napari. Stable output URIs
 and per-solver failures remain visible in the text panel.

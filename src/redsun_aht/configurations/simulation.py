@@ -20,7 +20,7 @@ from redsun_aht.storage import (
 )
 from redsun_aht.streams import PRIMARY_STREAM
 
-from .profiles import PROFILES, ApplicationProfile
+from .profiles import PROFILES, ProfileConfig, profile_metadata
 from .redsun_simulation import build_redsun_simulation_container
 
 if TYPE_CHECKING:
@@ -37,7 +37,7 @@ if TYPE_CHECKING:
 class SimulationApplication:
     """Minimal composition used to prove lifecycle and replay contracts."""
 
-    profile: ApplicationProfile
+    profile: ProfileConfig
     controller: RunController
     document_journal: DocumentJournal
     manifest: RunManifest
@@ -102,7 +102,8 @@ def build_simulation(
 ) -> SimulationApplication:
     """Build, but do not run, the hardware-free simulation composition."""
     profile = PROFILES["simulate"]
-    if profile.constructs_hardware:
+    metadata = profile_metadata(profile)
+    if metadata["constructs_hardware"]:
         raise AssertionError("simulation profile must never construct hardware")
     resolved_run_id = run_id or str(uuid4())
     controller = RunController(resolved_run_id, EventJournal(journal_path))
@@ -122,16 +123,16 @@ def build_simulation(
         software_version=__version__,
         hardware={
             "devices": [
-                {
-                    "id": selection.device_id,
-                    "backend": selection.backend.value,
-                }
-                for selection in profile.devices
+                {"id": selection["id"], "backend": selection["backend"]}
+                for selection in metadata["devices"]
             ]
         },
         reconstruction={"plugins": []},
         experiment={"recipe": "simulation", "streams": [PRIMARY_STREAM]},
-        deployment={"profile": profile.name, "frontend": "headless"},
+        deployment={
+            "profile": metadata["profile"],
+            "frontend": profile["frontend"],
+        },
     )
     manifest_store = RunManifestStore(manifest_path)
     manifest_store.write(manifest)

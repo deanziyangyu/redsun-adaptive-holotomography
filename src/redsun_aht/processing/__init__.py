@@ -1,13 +1,23 @@
 """Detached hardware-free processing contracts and worker supervision."""
 
+from redsun_aht.domain import MultiSliceAcquisitionMode
+
 from .fixed_median import (
     FixedMedian,
     fixed_median_from_czyx,
     fixed_median_from_czyx_store,
 )
+from .msbp_matlab import (
+    MSBPMatlabDataset,
+    load_msbp_matlab_dataset,
+    load_msbp_matlab_reference,
+    rytov_initial_guess,
+    solve_msbp_matlab_dataset,
+)
 from .multilayer import (
     BaseMultiLayerModel,
     ForwardResult,
+    MSBPForwardResult,
     MultiLayerBornModel,
     MultiLayerConfig,
     MultiSliceModel,
@@ -19,6 +29,7 @@ from .multilayer_iterative import (
     MultiLayerSolveResult,
     prox_tv_chambolle_3d,
     solve_multilayer,
+    solve_multislice,
 )
 from .multilayer_job import (
     MultiLayerProcessingPlan,
@@ -103,6 +114,8 @@ __all__ = [
     "GpuMeanProjectionSolver",
     "GpuResourcePool",
     "GpuResourceRequest",
+    "MSBPForwardResult",
+    "MSBPMatlabDataset",
     "MeanProjectionSolver",
     "MultiLayerBornModel",
     "MultiLayerConfig",
@@ -111,6 +124,7 @@ __all__ = [
     "MultiLayerReconstructionConfig",
     "MultiLayerSolveConfig",
     "MultiLayerSolveResult",
+    "MultiSliceAcquisitionMode",
     "MultiSliceModel",
     "NumpyQuantitativeTileSolver",
     "OfflineMultiLayerJobRequest",
@@ -138,6 +152,8 @@ __all__ = [
     "discover_nvidia_gpus",
     "fixed_median_from_czyx",
     "fixed_median_from_czyx_store",
+    "load_msbp_matlab_dataset",
+    "load_msbp_matlab_reference",
     "observations_from_camera_capture_bundle",
     "observations_from_dpct_bundle",
     "observations_from_offline_bundle",
@@ -152,6 +168,9 @@ __all__ = [
     "run_multilayer_processing_plan",
     "run_offline_processing_plan",
     "run_tiled_processing_plan",
+    "rytov_initial_guess",
+    "solve_msbp_matlab_dataset",
     "solve_multilayer",
+    "solve_multislice",
     "tile_weight",
 ]

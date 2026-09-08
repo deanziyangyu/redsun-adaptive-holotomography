@@ -19,6 +19,7 @@ from .illumination import (
     Panel91DpctPattern,
     panel91_dpct_quadrant_patterns,
 )
+from .plans import dpct_plan
 
 __all__ = [
     "PANEL91_DPCT_DONOR_GROUPS",
@@ -36,5 +37,6 @@ __all__ = [
     "PatternController",
     "TimingDistribution",
     "compose_simulation_documents",
+    "dpct_plan",
     "panel91_dpct_quadrant_patterns",
 ]

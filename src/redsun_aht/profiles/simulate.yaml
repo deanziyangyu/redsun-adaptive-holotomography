@@ -1,0 +1,24 @@
+schema_version: 1.0
+frontend: headless
+session: AHT simulation
+metadata:
+  profile: simulate
+  description: hardware-free deterministic lifecycle and replay
+  constructs_hardware: false
+  devices:
+    - id: detector
+      backend: mock
+devices: {}
+presenters:
+  storage_ctrl:
+    plugin_name: redsun
+    plugin_id: storage
+  lifecycle:
+    plugin_name: redsun-aht
+    plugin_id: simulation-lifecycle
+views: {}
+wiring:
+  - from: lifecycle.sig_run_started
+    to: storage_ctrl.set_plan
+  - from: lifecycle.sig_run_finished
+    to: storage_ctrl.reset_plan
