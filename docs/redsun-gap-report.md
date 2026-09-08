@@ -133,9 +133,24 @@ preserve AHT's detector-separated CZYX contract without hidden conventions.
 - Resource/datum metadata describing the real array path, index, shape, dtype,
   and chunk layout.
 
-The exact API shape and whether these capabilities belong in one or multiple
-upstream changes must be decided manually after a RedSun prototype and
-compatibility review.
+### Local upstream prototype
+
+The RedSun `feat/pre-upstream` working branch at `03009a5` now contains an additive
+`MultidimensionalOpenStore` protocol candidate. Its `IndexedWrite` carries a
+named `FramePlacement`, immutable opaque provenance context, and source
+checksum; `write_indexed()` returns a `PersistedWrite` receipt with the
+backend-observed checksum and URI. The protocol also requires mutually
+exclusive `complete()` and `abort()` terminal operations. It does not change
+the sequential `OpenStore.write()` or require the existing Mimir storage
+backends to migrate.
+
+This is a deliberately narrow public-contract prototype, not an AHT cutover:
+it does not yet include a Zarr implementation, coordinate-schema declaration,
+event-model resource/datum representation, or replay proof. The existing
+AHT DPCT Zarr store remains authoritative until a concrete backend satisfies
+the acceptance criteria below. The prototype's focused and full RedSun test
+suites pass; it requires owner review before promotion to `feat/upstream`, an
+issue, or a pull request.
 
 ### Acceptance criteria
 

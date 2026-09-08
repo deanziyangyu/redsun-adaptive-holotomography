@@ -72,8 +72,10 @@ Three areas intentionally differ from Mimir while remaining RedSun-native:
    AHT camera adapter on its dedicated hardware branch before an accepted
    RedSun release is promoted to production profiles.
 6. Prototype the durable multidimensional storage requirements upstream and
-   prepare issue-ready compatibility evidence. Preserve AHT's current durable
-   DPCT store until RedSun can represent its semantics without loss.
+   prepare issue-ready compatibility evidence. The first additive
+   `MultidimensionalOpenStore` contract candidate is on RedSun's
+   `feat/pre-upstream` (`03009a5`); preserve AHT's current durable DPCT store until a
+   concrete backend can represent its semantics without loss.
 7. Enforce the architecture with import/structure tests, profile composition
    tests, plan success/failure tests, GUI construction tests, and storage
    durability/replay tests.
