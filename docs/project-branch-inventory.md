@@ -23,8 +23,9 @@ Repository: `deanziyangyu/redsun-adaptive-holotomography`
   on an editable RedSun checkout in the `0.12` line. It was ancestry-merged with
   the `ours` strategy at `64fcbe4`, preserving its hardware-development record
   without restoring obsolete code, and its branch name was deleted.
-- After this inventory is committed, `feat/base_devices` is to be
-  fast-forwarded into `main` and both its local and remote branch names removed.
+- `feat/base_devices` was fast-forwarded into `main` after the complete static
+  and non-hardware test gate passed; both its local and remote branch names
+  were then removed.
 
 ## RedSun framework checkout
 
