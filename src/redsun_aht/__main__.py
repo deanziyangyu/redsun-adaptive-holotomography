@@ -32,6 +32,11 @@ from redsun_aht.processing import (
     QuantitativeTileConfig,
     TilingConfig,
 )
+from redsun_aht.ri_analysis import (
+    analyze_ri_tiff,
+    export_analysis_bundle,
+    load_config,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -100,6 +105,30 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     _add_tiled_processing_arguments(process_headless)
     _add_multilayer_processing_arguments(process_headless)
+    analyze_ri = subparsers.add_parser(
+        "analyze-ri",
+        help="analyze one donor-format uint16 ImageJ RI TIFF without hardware",
+    )
+    analyze_ri.add_argument("--input", type=Path, required=True)
+    analyze_ri.add_argument("--output", type=Path, required=True)
+    analyze_ri.add_argument(
+        "--config",
+        type=Path,
+        help="optional strict JSON RI-analysis configuration",
+    )
+    export_ri = subparsers.add_parser(
+        "export-ri-analysis",
+        help="export verified RI-analysis TIFF and CSV inspection products",
+    )
+    export_ri.add_argument("--input", type=Path, required=True)
+    export_ri.add_argument("--output", type=Path, required=True)
+    export_ri.add_argument(
+        "--format",
+        dest="formats",
+        choices=("tiff", "csv"),
+        action="append",
+        help="export format; repeat to select both (default: tiff and csv)",
+    )
     process_flyer = subparsers.add_parser(
         "process-flyer-replay",
         help="replay a verified run through two Bluesky processing flyers",
@@ -495,6 +524,31 @@ def main(argv: Sequence[str] | None = None) -> int:
         for solver_id, failure in processing.failures.items():
             print(f"{solver_id}: failed {failure}")
         return 0 if not processing.failures else 1
+    if args.command == "analyze-ri":
+        try:
+            ri_result = analyze_ri_tiff(
+                args.input, args.output, load_config(args.config)
+            )
+        except (OSError, ValueError) as error:
+            print(f"ERROR RI analysis: {error}", file=sys.stderr)
+            return 2
+        print(
+            f"RI analysis: {ri_result.label_count} labels, "
+            f"{ri_result.grid_cell_count} grid cells at {ri_result.bundle_path}"
+        )
+        return 0
+    if args.command == "export-ri-analysis":
+        try:
+            outputs = export_analysis_bundle(
+                args.input,
+                args.output,
+                formats=tuple(args.formats or ("tiff", "csv")),
+            )
+        except (OSError, ValueError) as error:
+            print(f"ERROR RI analysis export: {error}", file=sys.stderr)
+            return 2
+        print(f"exported {len(outputs)} RI analysis inspection files to {args.output}")
+        return 0
     if args.command == "process-gui":
         run_processing_gui(input_root=args.input, output_root=args.output)
         return 0
