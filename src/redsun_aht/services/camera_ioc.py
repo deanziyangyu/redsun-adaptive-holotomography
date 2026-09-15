@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import signal
+import sys
+import threading
 import time
 from contextlib import suppress
 from pathlib import Path
@@ -47,6 +50,63 @@ class CameraBackend(Protocol):
     def stop(self) -> None: ...
 
     def disconnect(self) -> None: ...
+
+
+class SimulatedCameraBackend:
+    """Deterministic frame backend exercising the same IOC path as MMCore."""
+
+    def __init__(self) -> None:
+        self._sequence = 0
+        self._running = False
+
+    def connect(self) -> CameraIdentity:
+        """Return deterministic simulated camera identity."""
+        from redsun_aht.device.camera.mmcore import CameraIdentity
+
+        return CameraIdentity(
+            label="SimulatedCamera",
+            adapter="simulation",
+            device_name="SimulatedCamera",
+            description="AHT deterministic camera service",
+            serial="SIM-0001",
+        )
+
+    def arm(self) -> None:
+        """Accept the simulated arm request."""
+        pass
+
+    def trigger(self) -> np.ndarray[Any, Any]:
+        """Return one deterministic, sequence-varying frame."""
+        frame = np.arange(6, dtype=np.uint16).reshape(2, 3) + self._sequence
+        self._sequence += 1
+        return frame
+
+    def start_sequence(
+        self,
+        *,
+        interval_ms: float,
+        buffer_memory_mb: int,
+        frame_count: int | None = None,
+    ) -> None:
+        """Start deterministic sequence generation."""
+        del interval_ms, buffer_memory_mb, frame_count
+        self._running = True
+
+    def drain_sequence(self) -> tuple[np.ndarray[Any, Any], ...]:
+        """Return one frame while sequence generation is active."""
+        return (self.trigger(),) if self._running else ()
+
+    def sequence_overflowed(self) -> bool:
+        """Report that the deterministic backend never overflows."""
+        return False
+
+    def stop(self) -> None:
+        """Stop deterministic sequence generation."""
+        self._running = False
+
+    def disconnect(self) -> None:
+        """Release deterministic sequence state."""
+        self._running = False
 
 
 class CameraServiceIOC(PVGroup):  # type: ignore[misc]  # caproto has no type metadata
@@ -568,6 +628,15 @@ def build_camera_ioc(
     )
 
 
+def _stop_when_stdin_closes() -> None:
+    """Translate RedSun's portable service stop request into Caproto SIGINT."""
+    try:
+        sys.stdin.read()
+    except OSError:
+        return
+    signal.raise_signal(signal.SIGINT)
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     """Run one camera IOC as an isolated service process."""
     parser = argparse.ArgumentParser(prog="aht-camera-ioc")
@@ -578,6 +647,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--acquisition-slots", type=int, default=4)
     parser.add_argument("--live-publish-hz", type=float, default=60.0)
     parser.add_argument("--live-buffer-memory-mb", type=int, default=128)
+    parser.add_argument(
+        "--stop-on-stdin-close",
+        action="store_true",
+        help="exit cleanly when a RedSun-launched service closes standard input",
+    )
     parser.add_argument(
         "--backend", choices=("simulation", "mmcore"), default="simulation"
     )
@@ -604,7 +678,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="Explicit admission-time MMCore property, repeatable.",
     )
     args = parser.parse_args(argv)
-    backend = None
+    backend: CameraBackend | None = SimulatedCameraBackend()
     if args.backend == "mmcore":
         required = {
             "--mm-config": args.mm_config,
@@ -662,6 +736,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         live_publish_hz=args.live_publish_hz,
         live_buffer_memory_mb=args.live_buffer_memory_mb,
     )
+    if args.stop_on_stdin_close:
+        threading.Thread(target=_stop_when_stdin_closes, daemon=True).start()
     try:
         run(ioc.pvdb, interfaces=["127.0.0.1"])
     finally:
@@ -670,7 +746,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     return 0
 
 
-__all__ = ["CameraServiceIOC", "build_camera_ioc", "main"]
+__all__ = [
+    "CameraServiceIOC",
+    "SimulatedCameraBackend",
+    "build_camera_ioc",
+    "main",
+]
 
 
 if __name__ == "__main__":  # pragma: no cover

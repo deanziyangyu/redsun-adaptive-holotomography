@@ -25,6 +25,8 @@ if TYPE_CHECKING:
 
     from redsun_aht.acquisition import DpctRecipe, DpctRunResult, DpctShotRecord
 
+from redsun_aht.acquisition.dpct import ExternalAssetInfo
+
 OME_ZARR_VERSION = "0.5"
 ZARR_FORMAT: Literal[3] = 3
 _MANIFEST_FIELDS = frozenset(
@@ -263,6 +265,37 @@ class DpctZarrStore:
     def uri(self) -> str:
         """Return the absolute run-bundle URI."""
         return self.root.resolve().as_uri()
+
+    def external_asset_info(self, detector_id: str) -> ExternalAssetInfo:
+        """Describe one detector array without routing frames through RedSun."""
+        with self._lock:
+            if detector_id not in self._detector_paths:
+                raise KeyError(f"DPCT detector is not declared: {detector_id}")
+            array_path = self._detector_paths[detector_id]
+            array = self._arrays.get(detector_id)
+            if array is None:
+                raise RuntimeError(
+                    "DPCT external asset is unavailable before its first frame"
+                )
+            recipe = self._recipe
+            if recipe is None:  # pragma: no cover - array implies begun store
+                raise RuntimeError("DPCT Zarr store has not begun")
+            return ExternalAssetInfo(
+                spec="AHT_OME_ZARR_DPCT_V1",
+                root=str(self.root.resolve()),
+                resource_path=self.zarr_path.name,
+                resource_kwargs={
+                    "schema_version": 1,
+                    "array_path": array_path,
+                    "dimension_names": ["pattern", "scan", "y", "x"],
+                    "pattern_ids": list(recipe.pattern_ids),
+                    "scan_indices": [point.index for point in recipe.scan_points],
+                    "shape": list(array.shape),
+                    "chunks": list(array.chunks),
+                    "dtype": str(array.dtype),
+                },
+                path_semantics="windows" if os.name == "nt" else "posix",
+            )
 
     def begin(self, recipe: DpctRecipe, detector_ids: tuple[str, ...]) -> None:
         """Create metadata and coordinate arrays for a fresh incomplete run."""

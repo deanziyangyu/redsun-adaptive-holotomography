@@ -8,6 +8,7 @@ from .detector_simulation import (
 )
 from .dpct_simulation import (
     DpctSimulation,
+    build_camera_service_dpct,
     build_dpct_simulation,
     build_panel91_dpct_simulation,
     run_dpct_simulation,
@@ -41,6 +42,7 @@ __all__ = [
     "ProfileConfig",
     "SimulatedMcuTestSession",
     "SimulationApplication",
+    "build_camera_service_dpct",
     "build_dpct_simulation",
     "build_dual_detector_simulation",
     "build_panel91_dpct_simulation",

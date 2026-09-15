@@ -1,12 +1,17 @@
 # RedSun framework gap report
 
-Status: the EPICS/device-lifecycle candidate is published for review on the
-personal RedSun fork and tracked by canonical RedSun
-[issue #107](https://github.com/redsun-acquisition/redsun/issues/107). No pull
-request has been opened; the branch is waiting for owner review.
+Status: RedSun `0.13.0rc0` resolves the EPICS service-lifecycle gap through a
+container-owned service layer and ordinary ophyd-async devices. The earlier
+EPICS/device-shutdown candidate on the personal fork is superseded and should
+not be proposed for merge. AHT now validates the released-candidate design in
+simulation and on the available FLIR hardware.
 
-AHT compatibility baseline: RedSun 0.11.0. The upstream candidate is based on
-canonical RedSun v0.12.2. Reinspect the current upstream revision before
+A historical issue/merge description remains in
+[`redsun-feat-upstream-merge-note.md`](redsun-feat-upstream-merge-note.md), but
+it no longer represents the recommended upstream change.
+
+AHT validation baseline: RedSun `0.13.0rc0` with ophyd-async `0.21.2`.
+Reinspect the current upstream revision and emerging branches before
 implementing or filing each additional candidate.
 
 ## Branch reconnaissance
@@ -43,43 +48,26 @@ review packet.
 
 ## EPICS service device and device teardown
 
-### Observed gap
+### Resolution in 0.13.0rc0
 
-RedSun accepts any ophyd-async `Device` as a declared device and publishes a
-`HasAsyncShutdown` protocol, but it does not provide a public EPICS service
-device base. `AppContainer.shutdown()` currently shuts down presenters but does
-not invoke `HasAsyncShutdown` devices.
+RedSun now declares services separately from devices, launches services before
+building dependent devices, injects the configured service prefix, and closes
+launched subprocesses during container teardown. AHT therefore uses
+ophyd-async's EPICS device directly and does not require a RedSun EPICS
+subclass, `service_prefix` property, or device-level `shutdown()` protocol.
 
-AHT consequently derives `CameraServiceDevice` directly from ophyd-async's
-`EpicsDevice`, and its service stop/disconnect lifecycle is outside RedSun
-container ownership.
+The service owns MMCore and the vendor SDK. The ophyd-async device is the
+application abstraction over its EPICS interface. Hardware-specific standby
+or resume signals remain optional IOC/device features rather than a generic
+EPICS lifecycle contract.
 
-### Proposed generic API
+Validation covers a RedSun-launched simulated camera IOC and the physical FLIR
+camera. In both cases the service/device composition produced external assets
+and container shutdown stopped the launched service. The AHT implementation
+also supports exact retained-frame acknowledgement only after durable write
+and checksum verification.
 
-- Add a public `redsun.device.epics.EpicsServiceDevice` abstract class derived
-  from ophyd-async `EpicsDevice` and RedSun's asynchronous shutdown contract.
-- Let the base own the stable EPICS prefix/name contract while subclasses
-  declare application-specific PVs and implement shutdown.
-- Make container shutdown stop presenters first, then await shutdown of every
-  device implementing `HasAsyncShutdown`; one failure must not skip remaining
-  cleanup and must be reported to the caller/log.
-
-### Acceptance criteria
-
-- EPICS devices remain valid RedSun plugin devices and support ophyd mock
-  connection.
-- Container shutdown invokes each asynchronous device exactly once.
-- Presenter shutdown precedes device shutdown.
-- Partial failure still cleans the remaining devices.
-- AHT can derive camera and future illumination adapters from the public base
-  without a local compatibility abstraction.
-
-### AHT impact
-
-Blocked until the upstream API is manually approved and merged. Caproto IOC
-work may continue because it is below the application-device boundary.
-
-### Local upstream review candidate
+### Superseded local upstream review candidate
 
 A candidate is implemented in the sibling RedSun checkout on branch
 `feat/upstream`, based on the inspected v0.12.2 canonical `main` line. The
@@ -95,21 +83,20 @@ It contains:
   connection state; and
 - focused EPICS and lifecycle tests.
 
-The candidate is published at
+The candidate remains published for history at
 [`deanziyangyu/redsun:feat/upstream`](https://github.com/deanziyangyu/redsun/tree/feat/upstream)
 at commit `1a1879f`. Verification in the RedSun checkout: 562 tests passed,
 statement coverage was 96%, Ruff and formatting checks passed, and Mypy passed
 against both PyQt6 and PySide6. RedSun's hosted Codecov upload runs for `main`
 or pull-request CI, so it will not run from the fork branch push alone.
 
-Manual review should decide whether shutdown errors remain logged or are
-aggregated for callers, whether the EPICS extra belongs in core, and how this
-change should be rebased onto `feat/experimental-di`. AHT must not copy this
-unmerged API locally.
+Do not merge or copy this candidate into AHT. RedSun `0.13.0rc0` addresses the
+underlying need with the maintainer's service model and intentionally leaves
+device-level shutdown out.
 
 ## Multidimensional durable storage
 
-### Observed gap
+### Historical limitation and validation result
 
 RedSun 0.11 `StreamSpec` describes sequential two-dimensional frames and
 `OpenStore.write()` receives only a data key and array. `FrameSink.put()`
@@ -120,7 +107,15 @@ checksum, append-only commit record, or atomic complete/abort publication.
 The bundled acquire-zarr backend writes time/y/x arrays and therefore cannot
 preserve AHT's detector-separated CZYX contract without hidden conventions.
 
-### Required generic capabilities
+RedSun `0.13.0rc0` now supplies the missing service lifecycle and composes
+ordinary ophyd-async devices over launched or attached services. The storage
+shim remains, but the relevant open question is now whether a service-owned
+writer can bypass it and emit standard Bluesky external-asset documents
+through the RedSun RunEngine without loss. That path now passes in
+hardware-free, RedSun-launched-service, and FLIR-only hardware tests. A RedSun
+multidimensional storage API gap is not established.
+
+### AHT service/device capabilities
 
 - Named multidimensional axes and deterministic frame placement.
 - Per-frame metadata or an opaque write context that reaches the backend.
@@ -129,38 +124,59 @@ preserve AHT's detector-separated CZYX contract without hidden conventions.
 - Resource/datum metadata describing the real array path, index, shape, dtype,
   and chunk layout.
 
-The exact API shape and whether these capabilities belong in one or multiple
-upstream changes must be decided manually after a RedSun prototype and
-compatibility review.
+These are requirements for AHT's service/device-owned writer, not proposed
+RedSun public classes unless a framework-level reproducer proves otherwise.
 
-### Acceptance criteria
+An initial protocol prototype is available on
+`deanziyangyu/redsun:feat/pre-upstream` at commit `03009a5`, but maintainer
+feedback superseded its RedSun-owned storage direction. The current pre-issue
+validation draft is maintained in
+[`redsun-multidimensional-storage-issue-note.md`](redsun-multidimensional-storage-issue-note.md).
+It records the service/device-owned design and the standard Bluesky
+external-asset path that must be validated before filing an issue. The
+older [`redsun-multidimensional-storage-pr-note.md`](redsun-multidimensional-storage-pr-note.md)
+is retained as design history only.
 
-- Existing sequential frame users remain source-compatible or have a bounded
-  migration path.
-- A DPCT backend can implement all existing durability and replay tests without
-  side channels in acquisition code.
+### Validation evidence
+
+- A service-backed ophyd-async device can participate without registering a
+  RedSun frame sink or storage backend.
+- Standard Resource/Datum documents pass through the RedSun RunEngine with
+  explicit non-sequential logical placement and checksum-resolvable assets.
+- A DPCT service/device writer can implement all existing durability and replay
+  tests without RedSun-specific frame-ingress APIs.
 - Detector acknowledgement occurs only after backend persistence and readback
   verification.
 - Abort never publishes a completion manifest.
+- Non-linear placement and actual motor readbacks remain associated with the
+  correct external frame.
+- Generic `bluesky-tiled-plugins.TiledWriter` creates the run and external
+  nodes but cannot directly read the DPCT array: its legacy normalizer reduces
+  Datum placement to sequential StreamDatum ranges and its generic Zarr
+  consolidator registers the group URI with an event-stacked shape. This is an
+  AHT/Tiled adapter gap, not a RedSun composition or storage gap.
 
 ### AHT impact
 
-DPCT Zarr remains on the current implementation until the upstream contract is
-accepted. No new acquisition path may weaken the existing durability contract
-to fit the current RedSun storage API.
+DPCT Zarr remains device/service-owned. No new acquisition path may weaken the
+existing durability contract to fit the current RedSun storage shim. The internal
+`DimensionSpec`/asset-spec, indexed-write, placement, receipt, completion, and
+abort concepts may be reused in AHT without making them RedSun APIs.
 
-### Issue-ready evidence
+### Disposition
 
-The current AHT regression contract provides the reproducer for a future
-storage issue: one DPCT shot is
+The current AHT regression contract supplies the application-side acceptance
+case: one DPCT shot is
 indexed by detector, scan position, illumination pattern, and channel; the
 camera frame is acknowledged only after Zarr persistence and checksum
 verification; completion publishes a manifest only after all expected shots
 exist; failure leaves an inspectable incomplete bundle. Attempting to map this
 onto RedSun 0.11/v0.12.2 loses named axes, write context, persisted receipts,
-and complete/abort semantics. These points and the existing
-`tests/test_dpct_zarr.py` success, tamper, incomplete, and collision tests
-should be attached to the manually created RedSun issue.
+and complete/abort semantics. The `0.13.0rc0` reproducer now proves the
+service-owned ophyd-async/Bluesky path. Do not file a RedSun multidimensional
+feature issue. Implement a format-aware AHT/Tiled registration adapter, and
+only consider a separate `bluesky-tiled-plugins` proposal if the resulting
+group-component Zarr support and placement model are broadly reusable.
 
 ## Conditional gaps to evaluate
 

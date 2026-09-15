@@ -1,8 +1,11 @@
 # DPCT OME-Zarr storage and replay
 
-Status: implemented hardware-free Phase 4 provenance/storage slice. Tiled
-registration, remote/object storage, partial-run resume, TIFF export, and
-physical acquisition remain pending.
+Status: the durable provenance/storage slice and standard Bluesky
+Resource/Datum publication are implemented. They pass hardware-free,
+RedSun-launched-service, and FLIR-only physical acquisition tests. Completed
+bundle registration through Tiled is implemented; a format-aware live-run
+Tiled adapter, remote/object storage, partial-run resume, and TIFF export
+remain pending.
 
 ## Bundle contract
 
@@ -68,6 +71,23 @@ state, commit-journal checksum, frame count, duplicate coverage, array layout,
 and every stored frame checksum before returning the completion manifest.
 Detector arrays are exposed for hardware-free processing only after the same
 verification.
+
+## Bluesky external assets and Tiled
+
+The DPCT detector group emits one Resource per detector array and one Datum per
+committed frame. Resource parameters declare the group URI, internal
+`array_path`, dimensions, full shape, chunks, dtype, pattern IDs, and ordered
+scan IDs. Datum metadata records the logical `(pattern, scan)` index, source
+identity, sequence, and checksum. Events reference those datum IDs while also
+recording actual stage and illumination readbacks.
+
+RedSun `0.13.0rc0` preserves these documents unchanged. The generic
+`bluesky-tiled-plugins` legacy normalizer does not yet provide direct array
+access for this layout: it converts placements into sequential StreamDatum
+ranges, derives an event-stacked shape, and points Tiled at the enclosing
+OME-Zarr group rather than the detector array. The remaining catalog task is
+an AHT-owned format-aware registration/consolidation adapter. This does not
+require a RedSun multidimensional storage interface.
 
 ## Standards baseline
 

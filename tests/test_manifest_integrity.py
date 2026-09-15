@@ -12,7 +12,11 @@ def test_redsun_manifest_has_only_supported_sections() -> None:
     manifest = yaml.safe_load(manifest_path.read_text(encoding="utf-8"))
 
     assert manifest == {
+        "services": {
+            "camera-ioc": {"module": "redsun_aht.services.camera_ioc"},
+        },
         "devices": {
+            "camera-service": "redsun_aht.device:CameraServiceDevice",
             "dpct-detector-group": "redsun_aht.device:DpctDetectorGroupDevice",
             "dpct-pattern": "redsun_aht.device:DpctPatternDevice",
             "dpct-stage": "redsun_aht.device:DpctStageDevice",

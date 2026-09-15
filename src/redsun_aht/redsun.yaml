@@ -1,4 +1,8 @@
+services:
+  camera-ioc:
+    module: redsun_aht.services.camera_ioc
 devices:
+  camera-service: redsun_aht.device:CameraServiceDevice
   dpct-stage: redsun_aht.device:DpctStageDevice
   dpct-pattern: redsun_aht.device:DpctPatternDevice
   dpct-detector-group: redsun_aht.device:DpctDetectorGroupDevice

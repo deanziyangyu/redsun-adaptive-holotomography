@@ -59,3 +59,26 @@ Changing `LOCALAPPDATA` in the process is not a reliable workaround on
 Windows: the `appdirs` implementation used by Napari may resolve the shell
 known-folder path instead of consulting that environment variable. AHT should
 not patch Napari's private fixture or cache functions in `conftest.py`.
+
+## EPICS Channel Access process isolation
+
+The Channel Access client reads settings such as `EPICS_CA_ADDR_LIST` when its
+process-global context is first initialized. A later test cannot reliably
+change that address list merely by updating the environment. Service-backed
+tests that require a different IOC address therefore run in a spawned child
+process, which receives a fresh Channel Access context. This is especially
+important when the full suite has already connected another EPICS test.
+
+Do not solve this by depending on test order. Keep the hardware-free and FLIR
+service cases behind the existing spawned-process helper, and return a compact
+result or traceback to the parent for assertion.
+
+## Windows virtual-environment ownership
+
+If dependencies were synchronized by an elevated process, a sandboxed test
+process may fail while importing an installed package with `PermissionError`.
+That is an environment ACL failure, not a failing AHT test. Prefer creating and
+synchronizing the virtual environment under the same account that runs tests.
+When diagnosing an existing elevated-owned environment, run the exact selected
+test with equivalent access; do not weaken repository assertions or silently
+skip the test.

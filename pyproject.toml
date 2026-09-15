@@ -31,9 +31,13 @@ dependencies = [
   "msgspec>=0.21.1,<0.22",
   "numpy>=2,<3",
   "opencv-python-headless==4.14.0.94",
-  "ophyd-async==0.21.1",
+  "ophyd-async==0.21.2",
   "psygnal>=0.15,<0.16",
-  "redsun[zarr]==0.11.0",
+  "redsun[epics,zarr]==0.13.0rc0",
+  "connected-components-3d>=3.23,<4",
+  "scikit-image>=0.25,<0.26",
+  "scipy>=1.15,<2",
+  "tifffile>=2025.1,<2027",
   "zarr==3.3.0",
 ]
 
@@ -48,6 +52,9 @@ dev = [
 ]
 
 [project.optional-dependencies]
+analysis = [
+  "matplotlib>=3.10,<4",
+]
 camera-mmcore = [
   "pymmcore==12.5.0.75.0",
   "pymmcore-plus==0.18.1",
@@ -68,11 +75,11 @@ catalog-tiled = [
 ]
 pyqt = [
   "napari[pyqt6]>=0.6.6",
-  "redsun[pyqt]==0.11.0",
+  "redsun[pyqt]==0.13.0rc0",
 ]
 pyside = [
   "napari[pyside6]>=0.6.6",
-  "redsun[pyside]==0.11.0",
+  "redsun[pyside]==0.13.0rc0",
 ]
 
 [project.scripts]

@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING, cast
 
 from bluesky.run_engine import RunEngineResult
 from bluesky.utils import FailedStatus
-from redsun.containers import AppContainer, declare_device
+from redsun.containers import AppContainer, declare_device, declare_service
 from redsun.engine import RunEngine
 
 from redsun_aht import __version__
@@ -39,6 +39,8 @@ from .profiles import profile_path
 
 if TYPE_CHECKING:
     from pathlib import Path
+
+    from redsun_aht.motion import ScanPoint
 
 
 @dataclass(slots=True)
@@ -114,6 +116,7 @@ def build_dpct_simulation(
     *,
     output_root: Path | None = None,
     pattern_ids: tuple[int, ...] = (10, 11),
+    scan_points: tuple[ScanPoint, ...] | None = None,
 ) -> DpctSimulation:
     """Build a two-pose, configurable-pattern, dual-detector simulation."""
     stage = CompositeStageDevice(
@@ -145,7 +148,7 @@ def build_dpct_simulation(
     )
     recipe = DpctRecipe(
         run_id=run_id,
-        scan_points=grid_scan({"z": (0.1, 0.2)}),
+        scan_points=scan_points or grid_scan({"z": (0.1, 0.2)}),
         pattern_ids=pattern_ids,
         detector_settings={"exposure_s": 0.01},
     )
@@ -185,6 +188,112 @@ def build_dpct_simulation(
         detectors=detectors,
         recipe=recipe,
         sink=sink,
+    )
+    return DpctSimulation(container, recipe, mcu)
+
+
+def build_camera_service_dpct(
+    run_id: str,
+    *,
+    output_root: Path,
+    camera_service_id: str = "dhm",
+    prefix: str = "AHT:FLIR:SERVICE:",
+    camera_ioc_args: tuple[str, ...] = (),
+    pattern_ids: tuple[int, ...] = (10, 11),
+    scan_points: tuple[ScanPoint, ...] | None = None,
+) -> DpctSimulation:
+    """Build one RedSun-launched EPICS camera service and durable DPCT writer."""
+    stage = CompositeStageDevice(
+        specs=(AxisSpec("z", "mm", 0, 1, 0.001),),
+        backends={"z": SimulatedAxisBackend(settle_polls=1)},
+        settle_poll_interval=0,
+    )
+    mcu = SimulatedMcu(
+        Capabilities(
+            firmware_version="1.0.0-sim",
+            target="aht-service-validation",
+            panel_profile="aht-test-4",
+            panel_revision=1,
+            led_count=4,
+            max_pattern_bytes=4,
+            max_sequence_steps=8,
+        )
+    )
+    illumination = McuHostClient(SimulatedMcuTransport(mcu), chunk_bytes=2)
+    if not pattern_ids or len(pattern_ids) > mcu.capabilities.led_count:
+        raise ValueError("DPCT service validation requires one to four pattern IDs")
+    for index, pattern_id in enumerate(pattern_ids):
+        payload = bytearray(mcu.capabilities.led_count)
+        payload[index] = 0xFF
+        illumination.upload_pattern(pattern_id, bytes(payload))
+    recipe = DpctRecipe(
+        run_id=run_id,
+        scan_points=scan_points or grid_scan({"z": (0.1, 0.2)}),
+        pattern_ids=pattern_ids,
+        detector_settings={},
+    )
+    run_manifest = RunManifest(
+        schema_version=1,
+        run_id=run_id,
+        created_ns=time.time_ns(),
+        software_version=__version__,
+        hardware={
+            "stage": {"backend": "simulation", "axes": ["z"]},
+            "mcu": {"backend": "simulation", "protocol": "native-v1"},
+            "detectors": [
+                {
+                    "id": camera_service_id,
+                    "backend": "redsun-launched-epics-service",
+                    "prefix": prefix,
+                }
+            ],
+        },
+        reconstruction={},
+        experiment={
+            "recipe": "dpct-service-validation",
+            "scan_points": [dict(point.positions) for point in recipe.scan_points],
+            "pattern_ids": list(recipe.pattern_ids),
+        },
+        deployment={"profile": "service-dpct", "python": ">=3.12"},
+    )
+    sink = DpctZarrStore(output_root, run_manifest)
+    stage_backend = stage
+    illumination_backend = illumination
+    acquisition_recipe = recipe
+    frame_sink = sink
+    service_prefix = prefix
+    service_id = camera_service_id
+    service_args = (
+        "--service-id",
+        service_id,
+        "--prefix",
+        service_prefix,
+        "--run-id",
+        run_id,
+        "--stop-on-stdin-close",
+        *camera_ioc_args,
+    )
+
+    class AHTCameraServiceDpctContainer(AppContainer):
+        camera_ioc = declare_service(
+            module="redsun_aht.services.camera_ioc",
+            prefix=service_prefix,
+            args=service_args,
+            stop_timeout=10,
+        )
+        stage = declare_device(DpctStageDevice, backend=stage_backend)
+        illumination = declare_device(DpctPatternDevice, backend=illumination_backend)
+        detectors = declare_device(
+            DpctDetectorGroupDevice,
+            recipe=acquisition_recipe,
+            sink=frame_sink,
+            service_id=service_id,
+            service="camera_ioc",
+        )
+
+    container = AHTCameraServiceDpctContainer(
+        session=f"AHT camera-service DPCT: {run_id}",
+        frontend="headless",
     )
     return DpctSimulation(container, recipe, mcu)
 
@@ -294,6 +403,7 @@ def build_panel91_dpct_simulation(
 
 __all__ = [
     "DpctSimulation",
+    "build_camera_service_dpct",
     "build_dpct_simulation",
     "build_panel91_dpct_simulation",
     "run_dpct_simulation",

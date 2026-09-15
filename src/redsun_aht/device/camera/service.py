@@ -3,16 +3,29 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+from multiprocessing import shared_memory
+from typing import TYPE_CHECKING, Any, Literal, cast
 from typing import Annotated as A
 
+import numpy as np
 from ophyd_async.core import AsyncStatus, SignalR, SignalW, TriggerableCommand
 from ophyd_async.epics.core import EpicsDevice, PvSuffix
 
 from redsun_aht.domain import (
     AcquisitionState,
+    ArrayReference,
+    Frame,
     HardwareServiceStatus,
     ServiceConnectionState,
 )
+
+if TYPE_CHECKING:
+    from collections.abc import Mapping
+
+    import numpy.typing as npt
+
+    from redsun_aht.domain.models import JsonValue
 
 
 class CameraServiceDevice(EpicsDevice):
@@ -131,4 +144,182 @@ class CameraServiceDevice(EpicsDevice):
         )
 
 
-__all__ = ["CameraServiceDevice"]
+class OphydAsyncCameraDetector:
+    """Adapt a composed camera-service device to AHT's lossless detector port."""
+
+    def __init__(self, service_id: str, control: CameraServiceDevice) -> None:
+        if not service_id:
+            raise ValueError("camera service_id must not be empty")
+        self._service_id = service_id
+        self.control = control
+        self._latest_frame: Frame | None = None
+        self._latest_memory_name: str | None = None
+        self._latest_slot: int | None = None
+
+    @property
+    def service_id(self) -> str:
+        """Return the stable detector identity, distinct from the service PV."""
+        return self._service_id
+
+    async def connect(self) -> None:
+        """Connect the service-owned hardware and verify its declared identity."""
+        await self.control.connect()
+        await self.control.request_connect()
+        observed = await self.control.service_id.get_value()
+        if observed != self._service_id:
+            await self.control.request_disconnect()
+            raise RuntimeError(
+                f"camera IOC service ID {observed!r} does not match "
+                f"{self._service_id!r}"
+            )
+
+    async def configure(self, settings: Mapping[str, JsonValue]) -> str:
+        """Reject settings not represented by the current typed IOC schema."""
+        if settings:
+            raise ValueError(
+                "camera IOC configuration is not implemented; "
+                "DPCT detector_settings must be empty"
+            )
+        return "camera-ioc-fixed-configuration-v1"
+
+    async def arm(self) -> None:
+        """Arm the service through its ophyd-async command signal."""
+        await self.control.arm()
+
+    async def trigger(self) -> None:
+        """Trigger one frame and retain its immutable descriptor."""
+        await self.control.trigger()
+        values = await asyncio.gather(
+            self.control.descriptor_generation.get_value(),
+            self.control.descriptor_sequence.get_value(),
+            self.control.descriptor_slot.get_value(),
+            self.control.descriptor_name.get_value(),
+            self.control.descriptor_run_id.get_value(),
+            self.control.descriptor_frame_id.get_value(),
+            self.control.descriptor_shape.get_value(),
+            self.control.descriptor_dtype.get_value(),
+            self.control.descriptor_byte_order.get_value(),
+            self.control.descriptor_timestamp_ns.get_value(),
+            self.control.descriptor_checksum_hi.get_value(),
+            self.control.descriptor_checksum_lo.get_value(),
+        )
+        (
+            generation,
+            sequence,
+            slot,
+            memory_name,
+            run_id,
+            frame_id,
+            raw_shape,
+            dtype,
+            byte_order,
+            timestamp_ns,
+            checksum_hi,
+            checksum_lo,
+        ) = values
+        shape = tuple(int(item) for item in str(raw_shape).split(","))
+        checksum = f"{checksum_hi}{checksum_lo}"
+        if (
+            int(sequence) < 0
+            or int(slot) < 0
+            or not shape
+            or any(item <= 0 for item in shape)
+            or not all((memory_name, run_id, frame_id))
+            or len(checksum) != 64
+        ):
+            raise RuntimeError("camera IOC published an invalid frame descriptor")
+        byte_order = str(byte_order)
+        if byte_order not in {"=", "<", ">", "|"}:
+            raise RuntimeError("camera IOC published an invalid byte order")
+        try:
+            np.dtype(str(dtype))
+        except TypeError as error:
+            raise RuntimeError("camera IOC published an invalid dtype") from error
+        timestamp = int(str(timestamp_ns))
+        self._latest_frame = Frame(
+            run_id=str(run_id),
+            frame_id=str(frame_id),
+            detector_id=self._service_id,
+            channel_id=self._service_id,
+            sequence=int(sequence),
+            exposure_started_ns=timestamp,
+            exposure_ended_ns=timestamp,
+            array=ArrayReference(
+                uri=(
+                    f"shm://{memory_name}?generation={generation}&slot={slot}"
+                    f"&sequence={sequence}"
+                ),
+                checksum=checksum,
+                shape=shape,
+                dtype=str(dtype),
+                byte_order=byte_order,
+            ),
+            configuration_revision="camera-ioc-fixed-configuration-v1",
+            quality_flags=frozenset({"exposure-window-unavailable"}),
+        )
+        self._latest_memory_name = str(memory_name)
+        self._latest_slot = int(slot)
+
+    async def read(self) -> Frame:
+        """Return metadata for the most recently committed frame."""
+        if self._latest_frame is None:
+            raise RuntimeError("camera IOC has not committed a frame")
+        return self._latest_frame
+
+    async def copy(self, sequence: int) -> npt.NDArray[Any]:
+        """Copy and checksum-verify one retained shared-memory frame."""
+        return await asyncio.to_thread(self._copy, sequence)
+
+    def _copy(self, sequence: int) -> npt.NDArray[Any]:
+        frame = self._require_latest(sequence)
+        memory_name = self._latest_memory_name
+        slot = self._latest_slot
+        if memory_name is None or slot is None:  # pragma: no cover - invariant
+            raise RuntimeError("camera IOC frame slot metadata is unavailable")
+        byte_order = cast(
+            "Literal['=', '<', '>', '|']",
+            frame.array.byte_order,
+        )
+        dtype = np.dtype(frame.array.dtype).newbyteorder(byte_order)
+        frame_bytes = int(np.prod(frame.array.shape, dtype=np.int64)) * dtype.itemsize
+        memory = shared_memory.SharedMemory(name=memory_name)
+        try:
+            copied = np.ndarray(
+                frame.array.shape,
+                dtype=dtype,
+                buffer=memory.buf,
+                offset=slot * frame_bytes,
+            ).copy()
+        finally:
+            memory.close()
+        checksum = hashlib.sha256(copied.tobytes(order="C")).hexdigest()
+        if checksum != frame.array.checksum:
+            raise ValueError("camera shared-memory frame checksum mismatch")
+        return copied
+
+    async def acknowledge(self, sequence: int) -> None:
+        """Release one frame only after the caller has persisted it."""
+        self._require_latest(sequence)
+        await self.control.acknowledge(sequence)
+
+    async def stop(self) -> None:
+        """Return the camera service to idle."""
+        await self.control.stop()
+
+    async def disconnect(self) -> None:
+        """Release hardware while leaving EPICS connection ownership to RedSun."""
+        try:
+            await self.control.request_disconnect()
+        finally:
+            self._latest_frame = None
+            self._latest_memory_name = None
+            self._latest_slot = None
+
+    def _require_latest(self, sequence: int) -> Frame:
+        frame = self._latest_frame
+        if frame is None or frame.sequence != sequence:
+            raise ValueError("camera IOC sequence does not match the latest frame")
+        return frame
+
+
+__all__ = ["CameraServiceDevice", "OphydAsyncCameraDetector"]

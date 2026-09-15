@@ -6,7 +6,7 @@ import asyncio
 import hashlib
 from dataclasses import dataclass
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Any, Literal, Protocol, cast
+from typing import TYPE_CHECKING, Any, Literal, Protocol, cast, runtime_checkable
 
 import numpy as np
 
@@ -90,6 +90,25 @@ class DpctFrameSink(Protocol):
 
     def fail(self, error: BaseException) -> None:
         """Mark an incomplete bundle without publishing completion."""
+
+
+@dataclass(frozen=True, slots=True)
+class ExternalAssetInfo:
+    """Backend-neutral location used to compose one Bluesky Resource."""
+
+    spec: str
+    root: str
+    resource_path: str
+    resource_kwargs: Mapping[str, JsonValue]
+    path_semantics: Literal["posix", "windows"]
+
+
+@runtime_checkable
+class DpctExternalAssetSink(Protocol):
+    """Optional sink capability for standard Bluesky external-asset documents."""
+
+    def external_asset_info(self, detector_id: str) -> ExternalAssetInfo:
+        """Describe the durable asset containing one detector's frames."""
 
 
 @dataclass(frozen=True, slots=True)

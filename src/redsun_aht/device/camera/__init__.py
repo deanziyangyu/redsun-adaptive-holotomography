@@ -9,7 +9,7 @@ from .mmcore import (
     MMCoreUnavailableError,
 )
 from .profiles import PVCAM_FCS_PROPERTIES
-from .service import CameraServiceDevice
+from .service import CameraServiceDevice, OphydAsyncCameraDetector
 
 __all__ = [
     "PVCAM_FCS_PROPERTIES",
@@ -20,4 +20,5 @@ __all__ = [
     "MMCoreCameraBackend",
     "MMCoreCameraProfile",
     "MMCoreUnavailableError",
+    "OphydAsyncCameraDetector",
 ]

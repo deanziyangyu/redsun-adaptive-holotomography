@@ -5,16 +5,27 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import time
+from collections import deque
 from typing import TYPE_CHECKING, Any, cast
 
 import numpy as np
+from event_model import compose_resource
 from ophyd_async.core import AsyncStatus, Device
 
-from redsun_aht.acquisition.dpct import DpctRunResult, DpctShotRecord
+from redsun_aht.acquisition.dpct import (
+    DpctExternalAssetSink,
+    DpctRunResult,
+    DpctShotRecord,
+)
+from redsun_aht.device.camera.service import (
+    CameraServiceDevice,
+    OphydAsyncCameraDetector,
+)
 
 if TYPE_CHECKING:
     from bluesky.protocols import Reading
     from event_model import DataKey
+    from event_model.documents import Datum, Resource
 
     from redsun_aht.acquisition.dpct import (
         DpctDetector,
@@ -30,7 +41,7 @@ if TYPE_CHECKING:
 class DpctStageDevice(Device):
     """Expose the validated composite stage as a RedSun device."""
 
-    def __init__(self, name: str, /, *, backend: CompositeStage) -> None:
+    def __init__(self, name: str, *, backend: CompositeStage) -> None:
         super().__init__(name=name)
         self.backend = backend
         self.pose: PoseSample | None = None
@@ -97,7 +108,7 @@ class DpctStageDevice(Device):
 class DpctPatternDevice(Device):
     """Expose synchronous illumination pattern selection as a RedSun device."""
 
-    def __init__(self, name: str, /, *, backend: PatternController) -> None:
+    def __init__(self, name: str, *, backend: PatternController) -> None:
         super().__init__(name=name)
         self.backend = backend
         self.pattern_id: int | None = None
@@ -153,13 +164,25 @@ class DpctDetectorGroupDevice(Device):
     def __init__(
         self,
         name: str,
-        /,
         *,
-        detectors: tuple[DpctDetector, ...],
+        detectors: tuple[DpctDetector, ...] | None = None,
         recipe: DpctRecipe,
         sink: DpctFrameSink | None = None,
+        prefix: str | None = None,
+        service_id: str | None = None,
     ) -> None:
-        super().__init__(name=name)
+        self.control: CameraServiceDevice | None = None
+        if detectors is None:
+            if prefix is None or service_id is None:
+                raise ValueError(
+                    "service-backed DPCT detector requires prefix and service_id"
+                )
+            self.control = CameraServiceDevice(prefix, name="")
+            detectors = (OphydAsyncCameraDetector(service_id, self.control),)
+        elif prefix is not None or service_id is not None:
+            raise ValueError(
+                "explicit detectors cannot be combined with prefix or service_id"
+            )
         detector_ids = tuple(detector.service_id for detector in detectors)
         if not detector_ids or len(set(detector_ids)) != len(detector_ids):
             raise ValueError("DPCT detectors must be non-empty and uniquely identified")
@@ -173,6 +196,12 @@ class DpctDetectorGroupDevice(Device):
         self._last_shot: DpctShotRecord | None = None
         self._result: DpctRunResult | None = None
         self._failure: BaseException | None = None
+        self._resource_bundles: dict[str, Any] = {}
+        self._pending_asset_docs: deque[tuple[str, Resource] | tuple[str, Datum]] = (
+            deque()
+        )
+        self._latest_datum_ids: dict[str, str] = {}
+        super().__init__(name=name)
 
     @property
     def result(self) -> DpctRunResult | None:
@@ -186,6 +215,9 @@ class DpctDetectorGroupDevice(Device):
     @AsyncStatus.wrap
     async def stage(self) -> None:
         """Connect, configure, and arm every detector before the run."""
+        self._resource_bundles.clear()
+        self._pending_asset_docs.clear()
+        self._latest_datum_ids.clear()
         try:
             for detector in self.detectors:
                 await detector.connect()
@@ -240,6 +272,7 @@ class DpctDetectorGroupDevice(Device):
             )
             if self.sink is not None:
                 await asyncio.to_thread(self.sink.write_shot, shot, arrays)
+                self._record_external_assets(shot)
             await asyncio.gather(
                 *(
                     detector.acknowledge(frame.sequence)
@@ -296,11 +329,18 @@ class DpctDetectorGroupDevice(Device):
                 "value": frame.array.checksum,
                 "timestamp": timestamp,
             }
+            datum_id = self._latest_datum_ids.get(frame.detector_id)
+            if datum_id is not None:
+                readings[f"{prefix}_image"] = {
+                    "value": datum_id,
+                    "timestamp": timestamp,
+                }
         return readings
 
     async def describe(self) -> dict[str, DataKey]:
         """Describe lightweight per-detector shot metadata."""
         description: dict[str, DataKey] = {}
+        shot = self._last_shot
         for detector in self.detectors:
             prefix = f"{self.name}_{detector.service_id}"
             description[f"{prefix}_sequence"] = {
@@ -314,7 +354,67 @@ class DpctDetectorGroupDevice(Device):
                     "dtype": "string",
                     "shape": [],
                 }
+            if detector.service_id in self._latest_datum_ids and shot is not None:
+                frame = next(
+                    frame
+                    for frame in shot.frames
+                    if frame.detector_id == detector.service_id
+                )
+                description[f"{prefix}_image"] = {
+                    "source": self.sink.uri if self.sink is not None else "",
+                    "dtype": "array",
+                    "dtype_numpy": frame.array.dtype,
+                    "shape": list(frame.array.shape),
+                    "external": "FILESTORE:",
+                }
         return description
+
+    async def collect_asset_docs(self) -> Any:
+        """Yield Resource/Datum documents produced by the service-owned sink."""
+        while self._pending_asset_docs:
+            yield self._pending_asset_docs.popleft()
+
+    def _record_external_assets(self, shot: DpctShotRecord) -> None:
+        sink = self.sink
+        if sink is None or not hasattr(sink, "external_asset_info"):
+            return
+        asset_sink = cast("DpctExternalAssetSink", sink)
+        scan_ordinal = next(
+            index
+            for index, point in enumerate(self.recipe.scan_points)
+            if point.index == shot.scan_index
+        )
+        pattern_ordinal = self.recipe.pattern_ids.index(shot.pattern_id)
+        for frame in shot.frames:
+            bundle = self._resource_bundles.get(frame.detector_id)
+            if bundle is None:
+                info = asset_sink.external_asset_info(frame.detector_id)
+                bundle = compose_resource(
+                    spec=info.spec,
+                    root=info.root,
+                    resource_path=info.resource_path,
+                    resource_kwargs=dict(info.resource_kwargs),
+                    path_semantics=info.path_semantics,
+                )
+                self._resource_bundles[frame.detector_id] = bundle
+                self._pending_asset_docs.append(("resource", bundle.resource_doc))
+            datum = bundle.compose_datum(
+                {
+                    "array_path": asset_sink.external_asset_info(
+                        frame.detector_id
+                    ).resource_kwargs["array_path"],
+                    "axes": ["pattern", "scan"],
+                    "index": [pattern_ordinal, scan_ordinal],
+                    "pattern_id": shot.pattern_id,
+                    "scan_index": shot.scan_index,
+                    "shot_index": shot.shot_index,
+                    "frame_id": frame.frame_id,
+                    "frame_sequence": frame.sequence,
+                    "checksum": frame.array.checksum,
+                }
+            )
+            self._pending_asset_docs.append(("datum", datum))
+            self._latest_datum_ids[frame.detector_id] = datum["datum_id"]
 
     async def _cleanup(self) -> None:
         try:

@@ -3,11 +3,14 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Generator
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import numpy as np
 import pytest
+from bluesky.run_engine import RunEngineResult
+from redsun.engine import RunEngine
 
+from redsun_aht.acquisition import dpct_plan
 from redsun_aht.catalog import (
     CatalogConflictError,
     CatalogRegistration,
@@ -24,6 +27,12 @@ from redsun_aht.configurations import (
     build_dpct_simulation,
     run_processing_flyer_replay,
 )
+from redsun_aht.device import (
+    DpctDetectorGroupDevice,
+    DpctPatternDevice,
+    DpctStageDevice,
+)
+from redsun_aht.motion import ScanPoint
 from redsun_aht.processing import observations_from_dpct_bundle
 from redsun_aht.storage import DpctZarrReplay
 
@@ -31,6 +40,9 @@ tiled_client = pytest.importorskip("tiled.client")
 tiled_server = pytest.importorskip("tiled.server")
 tiled_media_types = pytest.importorskip("tiled.media_type_registration")
 bluesky_exporters = pytest.importorskip("bluesky_tiled_plugins.exporters")
+TiledWriter = pytest.importorskip(
+    "bluesky_tiled_plugins.writing.tiled_writer"
+).TiledWriter
 
 pytestmark = pytest.mark.catalog
 
@@ -67,6 +79,62 @@ def _create_replay(tmp_path: Path, output_name: str) -> tuple[Path, Any]:
         tmp_path / "catalog-readable" / output_name,
     )
     return input_root, replay
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "generic TiledWriter treats the DPCT OME-Zarr group as an event-stacked "
+        "array; a format-aware component adapter is required"
+    ),
+)
+def test_tiled_writer_ingests_live_multidimensional_dpct_assets(
+    tmp_path: Path,
+    local_catalog: Any,
+) -> None:
+    output_root = tmp_path / "catalog-readable" / "live-input"
+    application = build_dpct_simulation(
+        "catalog-live-run",
+        output_root=output_root,
+        pattern_ids=(10, 11),
+        scan_points=(ScanPoint(17, (("z", 0.1),)), ScanPoint(3, (("z", 0.2),))),
+    )
+    writer = TiledWriter(
+        local_catalog,
+        spec_to_mimetype={"AHT_OME_ZARR_DPCT_V1": "application/x-zarr"},
+        batch_size=1,
+    )
+    engine = RunEngine({})
+    engine.subscribe(writer)  # type: ignore[no-untyped-call]
+    application.container.build()
+    try:
+        stage = cast(DpctStageDevice, application.container.devices["stage"])
+        illumination = cast(
+            DpctPatternDevice, application.container.devices["illumination"]
+        )
+        detectors = cast(
+            DpctDetectorGroupDevice, application.container.devices["detectors"]
+        )
+        result = cast(
+            RunEngineResult,
+            engine(
+                dpct_plan(stage, illumination, detectors, application.recipe)
+            ).result(timeout=30),
+        )
+    finally:
+        application.container.shutdown()
+
+    run_uid = result.run_start_uids[0]
+    run = local_catalog[run_uid]
+    manifest = DpctZarrReplay(output_root).verify()
+    for detector_id in manifest.detector_arrays:
+        image_key = f"detectors_{detector_id}_image"
+        external = run["primary"][image_key]
+        np.testing.assert_array_equal(
+            external[:],
+            DpctZarrReplay(output_root).read_detector(detector_id),
+        )
+        assert tuple(external.dims) == ("pattern", "scan", "y", "x")
 
 
 def test_tiled_registers_processing_documents_and_verified_zarr_assets(
