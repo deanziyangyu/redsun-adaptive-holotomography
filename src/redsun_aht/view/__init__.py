@@ -1,5 +1,1 @@
-"""Reusable Qt and Napari views.
-
-Optional Qt-backed modules are not imported here so the base package remains
-usable without a selected Qt binding.
-"""
+"""Qt views for the detector and acquisition pages."""

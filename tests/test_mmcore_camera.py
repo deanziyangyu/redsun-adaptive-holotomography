@@ -1,446 +1,338 @@
+"""Tests for the ``MMCamera`` device over the camera service's signal set.
+
+The device is connected in mock mode, so what is checked is its own wiring and
+logic: which settings it reports, when ``trigger`` completes, what the optional
+dark-frame retry does, and what the plan-facing ``redsun_aht.contracts`` adapter
+makes of the published signals. The service behind the signals is qualified in
+``test_mmcore_services.py``.
+"""
+
 from __future__ import annotations
 
 import asyncio
-import hashlib
-from multiprocessing import shared_memory
-from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import pytest
+from ophyd_async.core import get_mock_put, set_mock_value
 
-from redsun_aht.buffers import BufferFullError
-from redsun_aht.device.camera import (
-    CameraAdmissionError,
-    MMCoreCameraBackend,
-    MMCoreCameraProfile,
+from redsun_aht.contracts import (
+    Camera,
+    CameraSettings,
+    Roi,
+    SettingRefused,
+    TriggerMode,
 )
-from redsun_aht.services.camera_ioc import build_camera_ioc
+from redsun_aht.device.mmcore import MMCamera
+from redsun_aht.device.mmcore import camera as camera_device
+from redsun_aht.device.mmcore.camera import (
+    DEFAULT_DARK_FRAME_STRUCTURE_DN,
+    FAULTED,
+    frame_has_signal,
+    frame_shape_and_dtype,
+    trigger_until_lit,
+)
+from redsun_aht.device.spinnaker_camera import SpinnakerCamera
+from redsun_aht.protocols import LiveFlyer
+
+if TYPE_CHECKING:
+    from collections.abc import AsyncGenerator
+    from pathlib import Path
+
+SHAPE = (4, 6)
 
 
-class FakeCore:
-    def __init__(
-        self,
-        *,
-        label: str = "Camera-1",
-        adapter: str = "PVCAM",
-        device_name: str = "Camera-1",
-        serial: str = "prime-test",
-    ) -> None:
-        self.label = label
-        self.adapter = adapter
-        self.device_name = device_name
-        self.serial = serial
-        self.auto_shutter = True
-        self.loaded_config: str | None = None
-        self.snap_count = 0
-        self.stop_count = 0
-        self.clear_buffer_count = 0
-        self.initialize_buffer_count = 0
-        self.buffer_memory_mb: int | None = None
-        self.continuous_intervals: list[float] = []
-        self.finite_sequences: list[tuple[int, float, bool]] = []
-        self.sequence_frames: list[np.ndarray[Any, np.dtype[np.uint16]]] = []
-        self.buffer_overflowed = False
-        self.unload_count = 0
-        self.exposure_ms = 10.0
-        self.roi = (0, 0, 3, 2)
-        self.properties = {"Serial Number": serial, "Exposure": "10.0"}
+@pytest.fixture(params=[MMCamera, SpinnakerCamera], ids=["mmcore", "spinnaker"])
+async def camera(
+    tmp_path: Path, request: pytest.FixtureRequest
+) -> AsyncGenerator[MMCamera, None]:
+    """Return a camera connected to mock signals instead of a service."""
+    from redsun.path_provider import SessionPathProvider
 
-    def loadSystemConfiguration(self, path: str) -> None:
-        self.loaded_config = path
-
-    def getCameraDevice(self) -> str:
-        return self.label
-
-    def getLoadedDevices(self) -> tuple[str, ...]:
-        return (self.label,)
-
-    def getDeviceType(self, label: str) -> str:
-        assert label == self.label
-        return "Camera"
-
-    def getDeviceLibrary(self, label: str) -> str:
-        assert label == self.label
-        return self.adapter
-
-    def getDeviceName(self, label: str) -> str:
-        assert label == self.label
-        return self.device_name
-
-    def getDeviceDescription(self, label: str) -> str:
-        assert label == self.label
-        return "Fake scientific camera"
-
-    def getAutoShutter(self) -> bool:
-        return self.auto_shutter
-
-    def setAutoShutter(self, state: bool) -> None:
-        self.auto_shutter = state
-
-    def getDevicePropertyNames(self, label: str) -> tuple[str, ...]:
-        assert label == self.label
-        return tuple(self.properties)
-
-    def getProperty(self, label: str, name: str) -> str:
-        assert label == self.label
-        return self.properties[name]
-
-    def setProperty(self, label: str, name: str, value: str) -> None:
-        assert label == self.label
-        self.properties[name] = value
-
-    def isPropertyReadOnly(self, label: str, name: str) -> bool:
-        assert label == self.label
-        return name == "Serial Number"
-
-    def getAllowedPropertyValues(self, label: str, name: str) -> tuple[str, ...]:
-        assert label == self.label
-        return ()
-
-    def hasPropertyLimits(self, label: str, name: str) -> bool:
-        assert label == self.label
-        return name == "Exposure"
-
-    def getPropertyLowerLimit(self, label: str, name: str) -> float:
-        assert label == self.label and name == "Exposure"
-        return 0.1
-
-    def getPropertyUpperLimit(self, label: str, name: str) -> float:
-        assert label == self.label and name == "Exposure"
-        return 1000.0
-
-    def snapImage(self) -> None:
-        self.snap_count += 1
-
-    def getImage(self) -> np.ndarray[Any, np.dtype[np.uint16]]:
-        return np.full((2, 3), self.snap_count, dtype=np.uint16)
-
-    def getExposure(self) -> float:
-        return self.exposure_ms
-
-    def setExposure(self, exposure_ms: float) -> None:
-        self.exposure_ms = exposure_ms
-        self.properties["Exposure"] = str(exposure_ms)
-
-    def getROI(self) -> tuple[int, int, int, int]:
-        return self.roi
-
-    def setROI(self, x: int, y: int, width: int, height: int) -> None:
-        self.roi = (x, y, width, height)
-
-    def clearCircularBuffer(self) -> None:
-        self.clear_buffer_count += 1
-        self.sequence_frames.clear()
-
-    def setCircularBufferMemoryFootprint(self, size_mb: int) -> None:
-        self.buffer_memory_mb = size_mb
-
-    def initializeCircularBuffer(self) -> None:
-        self.initialize_buffer_count += 1
-
-    def startSequenceAcquisition(
-        self, frame_count: int, interval_ms: float, stop_on_overflow: bool
-    ) -> None:
-        self.finite_sequences.append((frame_count, interval_ms, stop_on_overflow))
-
-    def startContinuousSequenceAcquisition(self, interval_ms: float) -> None:
-        self.continuous_intervals.append(interval_ms)
-
-    def getRemainingImageCount(self) -> int:
-        return len(self.sequence_frames)
-
-    def popNextImage(self) -> np.ndarray[Any, np.dtype[np.uint16]]:
-        return self.sequence_frames.pop(0)
-
-    def isBufferOverflowed(self) -> bool:
-        return self.buffer_overflowed
-
-    def stopSequenceAcquisition(self) -> None:
-        self.stop_count += 1
-
-    def unloadAllDevices(self) -> None:
-        self.unload_count += 1
+    device = request.param(
+        "PREFIX:CAM:",
+        path_provider=SessionPathProvider(base_dir=tmp_path, session="test"),
+        name="cam",
+    )
+    await device.connect(mock=True)
+    set_mock_value(device.state, "acquiring")
+    set_mock_value(device.last_error, "")
+    set_mock_value(device.frame_count, 0)
+    set_mock_value(device.roi, "0,0,6,4")
+    set_mock_value(device.pixel_dtype, "uint8")
+    set_mock_value(device.pixel_dtypes, "uint8,uint16")
+    set_mock_value(device.binning_factors, "1,2")
+    set_mock_value(device.sensor_size_binning, "1x1")
+    set_mock_value(device.sensor_size, np.array([6, 4], dtype=np.int32))
+    set_mock_value(device.exposure, 10.0)
+    set_mock_value(device.exposure_range, np.array([0.1, 1000.0]))
+    set_mock_value(device.settings_revision, 7)
+    set_mock_value(device.buffer, np.zeros(SHAPE, dtype=np.uint8))
+    yield device
 
 
-def _profile(tmp_path: Path, **changes: Any) -> MMCoreCameraProfile:
-    config = tmp_path / "camera.cfg"
-    config.write_text("# fake", encoding="utf-8")
-    values: dict[str, Any] = {
-        "service_id": "fluorescence",
-        "config_path": config,
-        "mm_path": tmp_path,
-        "adapter": "PVCAM",
-        "device_name": "Camera-1",
-        "expected_label": "Camera-1",
-        "serial_property": "Serial Number",
-        "expected_serial": "prime-test",
-    }
-    values.update(changes)
-    return MMCoreCameraProfile(**values)
+def pitched_frame(count: int = 200) -> np.ndarray:
+    """Return a frame with enough spread to count as lit."""
+    frame = np.zeros(SHAPE, dtype=np.uint16)
+    frame[0, 0] = count
+    return frame
 
 
-def test_backend_admits_one_camera_and_forces_auto_shutter_off(
-    tmp_path: Path,
+async def publish_frames(camera: MMCamera, values: list[int]) -> None:
+    """Publish the frame count a service would publish for each frame."""
+    for value in values:
+        set_mock_value(camera.frame_count, value)
+        await asyncio.sleep(0.02)
+
+
+async def test_frame_shape_and_dtype_come_from_the_roi_and_pixel_dtype(
+    camera: MMCamera,
 ) -> None:
-    core = FakeCore()
-    backend = MMCoreCameraBackend(_profile(tmp_path), core_factory=lambda path: core)
+    """Size frames from the ROI text and the dtype the camera reads out in."""
+    set_mock_value(camera.roi, "10,20,100,50")
+    set_mock_value(camera.pixel_dtype, "uint16")
 
-    identity = backend.connect()
-    assert identity.adapter == "PVCAM"
-    assert identity.serial == "prime-test"
-    assert backend.configured_exposure_ms() == "10"
-    assert core.auto_shutter is False
-    assert backend.properties()[1].limits == (0.1, 1000.0)
-
-    with pytest.raises(RuntimeError, match="not armed"):
-        backend.trigger()
-    backend.arm()
-    np.testing.assert_array_equal(backend.trigger(), np.ones((2, 3), dtype=np.uint16))
-    backend.stop()
-    backend.disconnect()
-    assert core.auto_shutter is False
-    assert core.unload_count == 1
+    assert await frame_shape_and_dtype(camera) == ((50, 100), "uint16")
 
 
-def test_backend_keeps_single_snap_and_sequence_paths_separate(tmp_path: Path) -> None:
-    core = FakeCore()
-    backend = MMCoreCameraBackend(_profile(tmp_path), core_factory=lambda path: core)
-    backend.connect()
+async def test_the_configuration_names_the_settings_a_reader_needs(
+    camera: MMCamera,
+) -> None:
+    """Describe the settings by name, and read the ones a record carries."""
+    described = set(await camera.describe_configuration())
 
-    backend.arm()
-    np.testing.assert_array_equal(backend.trigger(), np.ones((2, 3), dtype=np.uint16))
-    backend.stop()
-    core.sequence_frames.extend(
-        (
-            np.full((2, 3), 4, dtype=np.uint16),
-            np.full((2, 3), 5, dtype=np.uint16),
-        )
-    )
-    backend.start_sequence(interval_ms=1.5, buffer_memory_mb=64)
+    assert described == {
+        "cam-exposure",
+        "cam-pixel_dtype",
+        "cam-record_frame_timing",
+        "cam-roi",
+        "cam-sensor_size",
+        "cam-sensor_size_binning",
+        "cam-last_setting_change",
+    }
 
-    assert core.snap_count == 1
-    assert core.clear_buffer_count == 1
-    assert core.initialize_buffer_count == 1
-    assert core.buffer_memory_mb == 64
-    assert core.continuous_intervals == [1.5]
-    assert backend.drain_sequence() == ()
-    core.sequence_frames.extend(
-        (
-            np.full((2, 3), 4, dtype=np.uint16),
-            np.full((2, 3), 5, dtype=np.uint16),
-        )
-    )
-    drained = backend.drain_sequence()
-    assert len(drained) == 2
-    np.testing.assert_array_equal(drained[-1], np.full((2, 3), 5, dtype=np.uint16))
-    core.buffer_overflowed = True
-    assert backend.sequence_overflowed()
-    with pytest.raises(RuntimeError, match="sequence acquisition"):
-        backend.trigger()
+    readings = await camera.read_configuration()
+
+    assert set(readings) == described
+    assert readings["cam-roi"]["value"] == "0,0,6,4"
+    assert readings["cam-pixel_dtype"]["value"] == "uint8"
 
 
-def test_backend_uses_finite_sequence_api_for_list_scans(tmp_path: Path) -> None:
-    core = FakeCore()
-    backend = MMCoreCameraBackend(_profile(tmp_path), core_factory=lambda path: core)
-    backend.connect()
+async def test_a_trigger_completes_on_a_frame_taken_after_it(
+    camera: MMCamera,
+) -> None:
+    """Complete the trigger on a frame count newer than the one it saw."""
+    task = asyncio.ensure_future(camera.trigger())
 
-    backend.start_sequence(frame_count=7, interval_ms=2.5, buffer_memory_mb=32)
+    await publish_frames(camera, [1, 2])
 
-    assert core.finite_sequences == [(7, 2.5, True)]
-    assert core.continuous_intervals == []
-
-
-def test_backend_rejects_wrong_adapter_and_cleans_up(tmp_path: Path) -> None:
-    core = FakeCore(adapter="SpinnakerC")
-    backend = MMCoreCameraBackend(_profile(tmp_path), core_factory=lambda path: core)
-
-    with pytest.raises(CameraAdmissionError, match="does not match"):
-        backend.connect()
-    assert not backend.connected
-    assert core.auto_shutter is False
-    assert core.unload_count == 1
+    await asyncio.wait_for(task, 2.0)
 
 
-def test_backend_applies_an_explicit_initial_camera_property(tmp_path: Path) -> None:
-    core = FakeCore()
-    core.properties["PixelBinning"] = "1"
-    backend = MMCoreCameraBackend(
-        _profile(tmp_path, initial_properties={"PixelBinning": "2"}),
-        core_factory=lambda path: core,
-    )
+async def test_a_trigger_takes_one_frame_by_default(
+    camera: MMCamera, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Take exactly one exposure per trigger, even when the frame carries no light."""
+    monkeypatch.setattr(camera_device, "DEFAULT_TIMEOUT", 0.1)
 
-    backend.connect()
+    task = asyncio.ensure_future(camera.trigger())
+    await asyncio.sleep(0.02)
+    # the buffer holds no light, so a retaking trigger would wait for a third
+    # frame that never comes and time out instead
+    await publish_frames(camera, [1])
+    await asyncio.wait_for(task, 1.0)
 
-    assert core.properties["PixelBinning"] == "2"
-
-
-def test_backend_applies_an_explicit_mmcore_exposure(tmp_path: Path) -> None:
-    core = FakeCore()
-    backend = MMCoreCameraBackend(
-        _profile(tmp_path, initial_properties={"Exposure": "10"}),
-        core_factory=lambda path: core,
-    )
-
-    backend.connect()
-
-    assert backend.configured_exposure_ms() == "10"
+    assert camera._dark_frame_retries == 0
 
 
-def test_backend_applies_an_explicit_mmcore_roi(tmp_path: Path) -> None:
-    core = FakeCore()
-    backend = MMCoreCameraBackend(
-        _profile(tmp_path, initial_properties={"ROI": "0,0,808,620"}),
-        core_factory=lambda path: core,
-    )
+async def test_a_trigger_times_out_and_names_the_frame_count(
+    camera: MMCamera, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Fail with the count it was waiting past when the service sends nothing."""
+    monkeypatch.setattr(camera_device, "DEFAULT_TIMEOUT", 0.05)
 
-    backend.connect()
-
-    assert core.roi == (0, 0, 808, 620)
+    with pytest.raises(TimeoutError, match="still at 0"):
+        await camera.trigger()
 
 
-def test_spinnaker_profile_defaults_pixel_type_to_mono16(tmp_path: Path) -> None:
-    core = FakeCore(
-        label="Blackfly S BFS-U3-20S4M",
-        adapter="SpinnakerC",
-        device_name="Blackfly S BFS-U3-20S4M",
-        serial="20154173",
-    )
-    core.properties["Pixel Format"] = "Mono8"
-    backend = MMCoreCameraBackend(
-        _profile(
-            tmp_path,
-            adapter="SpinnakerC",
-            device_name="Blackfly S BFS-U3-20S4M",
-            expected_label="Blackfly S BFS-U3-20S4M",
-            expected_serial="20154173",
-        ),
-        core_factory=lambda path: core,
+async def test_a_faulted_camera_raises_its_own_error(camera: MMCamera) -> None:
+    """Raise the camera's error rather than waiting for a frame that is not coming."""
+    set_mock_value(camera.state, FAULTED)
+    set_mock_value(camera.last_error, "ValueError: the camera was unplugged")
+
+    with pytest.raises(RuntimeError, match="the camera was unplugged"):
+        await camera.trigger()
+
+
+def test_an_unlit_frame_is_told_from_a_lit_one() -> None:
+    """Separate the offset noise of a dark frame from the spread of a lit frame."""
+    dark = np.full(SHAPE, 100, dtype=np.uint16)
+    noise = np.full(SHAPE, 100, dtype=np.uint16)
+    noise[0, 0] = 104
+
+    assert not frame_has_signal(dark, DEFAULT_DARK_FRAME_STRUCTURE_DN)
+    assert not frame_has_signal(noise, DEFAULT_DARK_FRAME_STRUCTURE_DN)
+    assert frame_has_signal(pitched_frame(), DEFAULT_DARK_FRAME_STRUCTURE_DN)
+
+
+async def test_the_dark_frame_retry_retakes_until_a_frame_is_lit() -> None:
+    """Retake an unlit frame, and stop at the first one that carries light."""
+    triggered = 0
+    frames: list[np.ndarray] = [
+        np.full(SHAPE, 100, dtype=np.uint16),
+        np.full(SHAPE, 100, dtype=np.uint16),
+        pitched_frame(),
+    ]
+
+    async def trigger_once() -> None:
+        nonlocal triggered
+        triggered += 1
+
+    async def read_frame() -> np.ndarray:
+        return frames[triggered - 1]
+
+    attempts = await trigger_until_lit(
+        trigger_once,
+        read_frame,
+        retries=2,
+        structure_dn=DEFAULT_DARK_FRAME_STRUCTURE_DN,
     )
 
-    backend.connect()
+    assert attempts == 3
+    assert triggered == 3
 
-    assert core.properties["Pixel Format"] == "Mono16"
 
+async def test_the_last_retry_is_kept_even_when_it_is_still_dark() -> None:
+    """Keep the last frame of a retried trigger rather than looping for ever."""
+    triggered = 0
 
-def test_pvcam_and_spinnakerc_profiles_are_process_separable(tmp_path: Path) -> None:
-    pvcam = _profile(tmp_path)
-    flir = _profile(
-        tmp_path,
-        service_id="dhm",
-        adapter="SpinnakerC",
-        device_name="Blackfly S BFS-U3-20S4M",
-        expected_label="Blackfly S BFS-U3-20S4M",
-        expected_serial="20154173",
+    async def trigger_once() -> None:
+        nonlocal triggered
+        triggered += 1
+
+    async def read_frame() -> Any:
+        return np.full(SHAPE, 100, dtype=np.uint16)
+
+    attempts = await trigger_until_lit(
+        trigger_once,
+        read_frame,
+        retries=2,
+        structure_dn=DEFAULT_DARK_FRAME_STRUCTURE_DN,
     )
 
-    assert pvcam.adapter == "PVCAM"
-    assert flir.adapter == "SpinnakerC"
-    assert pvcam.config_path == flir.config_path
-    assert pvcam.service_id != flir.service_id
+    assert attempts == 3
+    assert triggered == 3
 
 
-def test_ioc_delegates_lifecycle_to_mmcore_backend(tmp_path: Path) -> None:
-    async def scenario() -> None:
-        core = FakeCore()
-        core.properties["Binning"] = "2"
-        core.properties["Pixel Format"] = "Mono16"
-        backend = MMCoreCameraBackend(
-            _profile(tmp_path), core_factory=lambda path: core
+async def test_describe_settings_reports_what_the_service_publishes(
+    camera: MMCamera,
+) -> None:
+    """Turn the published signals into the contract's camera description."""
+    description = await camera.describe_settings()
+
+    assert description.detector_id == "cam"
+    assert description.shape == (4, 6)
+    assert description.pixel_dtypes == ("uint8", "uint16")
+    assert description.pixel_dtype == "uint8"
+    assert description.exposure_range_s == pytest.approx((0.0001, 1.0))
+    assert description.roi_supported is True
+    assert description.binning == (1, 2)
+    assert description.trigger_modes == (TriggerMode.FREE_RUN, TriggerMode.SOFTWARE)
+    assert description.revision == 7
+
+
+async def test_describe_settings_refuses_an_unpublished_exposure_range(
+    camera: MMCamera,
+) -> None:
+    """Refuse to describe a camera whose exposure bound the adapter does not name."""
+    set_mock_value(camera.exposure_range, np.array([0.0, 0.0]))
+
+    with pytest.raises(SettingRefused, match="exposure_out_of_range"):
+        await camera.describe_settings()
+
+
+async def test_apply_settings_writes_the_settings_and_returns_the_revision(
+    camera: MMCamera,
+) -> None:
+    """Write the settings in the service's units, and report the revision it holds."""
+    revision = await camera.apply_settings(
+        CameraSettings(
+            exposure_s=0.02,
+            roi=Roi(1, 1, 2, 2),
+            binning=1,
+            pixel_dtype="uint16",
         )
-        ioc = build_camera_ioc(
-            "fluorescence",
-            "AHT:PVCAM:TEST:",
-            backend=backend,
-            acquisition_slots=1,
-        )
+    )
 
-        await ioc.command_connect.pvspec.put(ioc, ioc.command_connect, 1)
-        assert ioc.camera_adapter.value == "PVCAM"
-        assert ioc.camera_serial.value == "prime-test"
-        assert ioc.camera_pixel_binning.value == "2"
-        assert ioc.camera_pixel_type.value == "Mono16"
-        assert ioc.camera_exposure_ms.value == "10"
-        await ioc.command_arm.pvspec.put(ioc, ioc.command_arm, 1)
-        await ioc.command_trigger.pvspec.put(ioc, ioc.command_trigger, 1)
-        assert core.snap_count == 1
-        assert ioc.descriptor_run_id.value == "unassigned"
-        assert ioc.descriptor_shape.value == "2,3"
-        memory_name = str(ioc.descriptor_name.value)
-        memory = shared_memory.SharedMemory(name=memory_name)
-        try:
-            copied = np.ndarray(
-                (2, 3),
-                dtype=np.dtype(str(ioc.descriptor_dtype.value)),
-                buffer=memory.buf,
-            ).copy()
-        finally:
-            memory.close()
-        np.testing.assert_array_equal(copied, np.ones((2, 3), dtype=np.uint16))
-        checksum = hashlib.sha256(copied.tobytes(order="C")).hexdigest()
-        assert checksum == (
-            str(ioc.descriptor_checksum_hi.value)
-            + str(ioc.descriptor_checksum_lo.value)
-        )
-        with pytest.raises(BufferFullError):
-            await ioc.command_trigger.pvspec.put(ioc, ioc.command_trigger, 1)
-        assert core.snap_count == 1
-        assert ioc.frames_dropped.value == 1
-        await ioc.command_acknowledge.pvspec.put(
-            ioc, ioc.command_acknowledge, int(ioc.descriptor_sequence.value)
-        )
-        await ioc.command_trigger.pvspec.put(ioc, ioc.command_trigger, 1)
-        assert core.snap_count == 2
-        await ioc.command_acknowledge.pvspec.put(
-            ioc, ioc.command_acknowledge, int(ioc.descriptor_sequence.value)
-        )
-        await ioc.command_stop.pvspec.put(ioc, ioc.command_stop, 1)
-        await ioc.command_disconnect.pvspec.put(ioc, ioc.command_disconnect, 1)
-        assert core.unload_count == 1
-        with pytest.raises(FileNotFoundError):
-            shared_memory.SharedMemory(name=memory_name)
-
-    import asyncio
-
-    asyncio.run(scenario())
+    # seconds become the milliseconds Micro-Manager holds, and only here
+    get_mock_put(camera.exposure).assert_called_once_with(20.0)
+    get_mock_put(camera.roi).assert_called_once_with("1,1,2,2")
+    get_mock_put(camera.pixel_dtype).assert_called_once_with("uint16")
+    # the fixture publishes no writable Binning property and the requested
+    # factor is the one already in force, so nothing is written for it
+    assert camera.properties.get("Binning") is None
+    assert revision == 7
 
 
-def test_ioc_live_view_drains_sequence_without_single_snaps(tmp_path: Path) -> None:
-    async def scenario() -> None:
-        core = FakeCore()
-        backend = MMCoreCameraBackend(
-            _profile(tmp_path), core_factory=lambda path: core
-        )
-        ioc = build_camera_ioc(
-            "fluorescence",
-            "AHT:PVCAM:LIVE:",
-            backend=backend,
-            live_publish_hz=60,
-        )
-
-        await ioc.command_connect.pvspec.put(ioc, ioc.command_connect, 1)
-        await ioc.command_start_live.pvspec.put(ioc, ioc.command_start_live, 1)
-        core.sequence_frames.extend(
-            (
-                np.full((2, 3), 4, dtype=np.uint16),
-                np.full((2, 3), 5, dtype=np.uint16),
+async def test_apply_settings_refuses_before_it_writes(camera: MMCamera) -> None:
+    """Refuse a setting the description does not declare, without writing any."""
+    with pytest.raises(SettingRefused, match="exposure_out_of_range"):
+        await camera.apply_settings(
+            CameraSettings(
+                exposure_s=5.0,
+                roi=Roi(0, 0, 6, 4),
+                binning=1,
+                pixel_dtype="uint8",
             )
         )
-        await asyncio.sleep(0.04)
 
-        assert core.snap_count == 0
-        assert core.continuous_intervals == [0.0]
-        assert ioc.live_state.value == "running"
-        assert ioc.live_frames_drained.value == 2
-        assert ioc.live_frames_published.value == 1
-        assert ioc.live_frames_skipped.value == 1
-        assert ioc.live_sequence.value == 1
-        payload = str(ioc.live_image.value).encode("latin-1")
-        image = np.frombuffer(payload, dtype=np.dtype(str(ioc.live_dtype.value)))
-        np.testing.assert_array_equal(image.reshape(2, 3), np.full((2, 3), 5))
+    get_mock_put(camera.exposure).assert_not_called()
+    get_mock_put(camera.roi).assert_not_called()
 
-        await ioc.command_stop.pvspec.put(ioc, ioc.command_stop, 1)
-        assert ioc.live_state.value == "idle"
-        assert ioc.acquisition_state.value == "idle"
+    with pytest.raises(SettingRefused, match="binning_unsupported"):
+        await camera.apply_settings(
+            CameraSettings(
+                exposure_s=0.02,
+                roi=Roi(0, 0, 6, 4),
+                binning=2,
+                pixel_dtype="uint8",
+            )
+        )
 
-    asyncio.run(scenario())
+    get_mock_put(camera.roi).assert_not_called()
+
+
+async def test_capture_frame_returns_the_frame_with_its_sequence(
+    camera: MMCamera,
+) -> None:
+    """Read one frame with the sequence, revision and exposure it was taken under."""
+    task = asyncio.ensure_future(camera.capture_frame())
+    await asyncio.sleep(0.02)
+    set_mock_value(camera.buffer, np.full(SHAPE, 3, dtype=np.uint8))
+    await publish_frames(camera, [11])
+
+    readout = await asyncio.wait_for(task, 2.0)
+
+    assert readout.shape == SHAPE
+    assert readout.dtype == "uint8"
+    assert int(readout.data[0, 0]) == 3
+    assert readout.sequence == 11
+    assert readout.setting_revision == 7
+    assert readout.exposure_s == pytest.approx(0.01)
+
+
+async def test_stop_clears_acquiring_and_capturing(camera: MMCamera) -> None:
+    """Stop the capture and then the camera, as a RunEngine stop expects."""
+    set_mock_value(camera.acquire, True)
+    set_mock_value(camera.capture, True)
+
+    await camera.stop()
+
+    get_mock_put(camera.capture).assert_called_once_with(False)
+    get_mock_put(camera.acquire).assert_called_once_with(False)
+
+
+def test_the_camera_is_a_live_flyer_and_a_contract_camera(camera: MMCamera) -> None:
+    """Satisfy the plan-facing protocols the live and scan plans accept."""
+    assert isinstance(camera, LiveFlyer)
+    assert isinstance(camera, Camera)

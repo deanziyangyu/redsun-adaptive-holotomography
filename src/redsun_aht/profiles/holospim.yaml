@@ -1,0 +1,47 @@
+# Host overlays supply the actual stage, camera and MCU configuration.
+schema_version: 1.0
+session: aht-holospim
+strict: true
+mock: true
+services:
+  transport: pv-access
+  survey_service:
+    plugin_name: redsun-aht
+    plugin_id: mmcore-stage
+    prefix: "HOLOSPIM-SURVEY:"
+    args:
+      adapter: "REPLACE_STAGE_ADAPTER"
+      device: "REPLACE_STAGE_DEVICE"
+      axes: "x,y,z"
+      limits: "REPLACE_SURVEY_LIMITS_UM"
+  camera_service:
+    plugin_name: redsun-aht
+    plugin_id: mmcore-camera
+    prefix: "HOLOSPIM-CAMERA:"
+    args:
+      adapter: "REPLACE_CAMERA_ADAPTER"
+      device: "REPLACE_CAMERA_DEVICE"
+  mcu_service:
+    plugin_name: redsun-aht
+    plugin_id: unified-mcu
+    prefix: "HOLOSPIM-MCU:"
+    args:
+      port: "REPLACE_MCU_SERIAL_PORT"
+      prefix: "HOLOSPIM-MCU:"
+devices:
+  survey:
+    plugin_name: redsun-aht
+    plugin_id: mmcore-stage
+    service: survey_service
+  camera:
+    plugin_name: redsun-aht
+    plugin_id: mmcore-camera
+    service: camera_service
+  rotation:
+    plugin_name: redsun-aht
+    plugin_id: unified-rotation
+    service: mcu_service
+  mcu:
+    plugin_name: redsun-aht
+    plugin_id: unified-mcu
+    service: mcu_service

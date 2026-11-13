@@ -1,0 +1,71 @@
+# Draft composition. Mock mode suppresses service launches.
+# Resolve every REPLACE_* value before deployment.
+schema_version: 1.0
+session: arh-lx4000
+strict: true
+mock: true
+
+services:
+  transport: pv-access
+  stage_service:
+    plugin_name: redsun-aht
+    plugin_id: asi-lx4000
+    prefix: "ARH-LX4000:"
+    args:
+      port: "REPLACE_LX4000_SERIAL_PORT"
+      baudrate: "REPLACE_LX4000_BAUD_RATE"
+      axes: "x,y,z"
+      counts-per-um: "REPLACE_XY_COUNTS_PER_UM"
+      z-counts-per-um: "REPLACE_Z_COUNTS_PER_UM"
+      max-xy-offset-um: "REPLACE_XY_STARTUP_RELATIVE_LIMIT_UM"
+      max-z-offset-um: "REPLACE_Z_STARTUP_RELATIVE_LIMIT_UM"
+  camera_service:
+    plugin_name: redsun-aht
+    plugin_id: spinnaker-camera
+    prefix: "ARH-FLIR:"
+    args:
+      serial: "REPLACE_FLIR_SERIAL"
+      pixel-format: "REPLACE_FLIR_PIXEL_FORMAT"
+  illumination_service:
+    plugin_name: redsun-aht
+    plugin_id: lumencor-spectra
+    prefix: "ARH-SPECTRA:"
+    args:
+      mmcore-config: "REPLACE_MMCORE_CONFIG_PATH"
+      mm-path: "REPLACE_MICROMANAGER_PATH"
+      device-label: "REPLACE_LUMENCOR_DEVICE_LABEL"
+      shutter-device: "REPLACE_LUMENCOR_SHUTTER_LABEL"
+      channel-group: "REPLACE_LUMENCOR_CHANNEL_GROUP"
+      allowed-presets: "REPLACE_LUMENCOR_ALLOWED_PRESETS"
+  mcu_service:
+    plugin_name: redsun-aht
+    plugin_id: unified-emmsh
+    prefix: "ARH-EMMSH:"
+    args:
+      port: "REPLACE_EMMSH_SERIAL_PORT"
+      baudrate: "REPLACE_EMMSH_BAUD_RATE"
+      firmware-revision: "REPLACE_EMMSH_FIRMWARE_REVISION"
+
+devices:
+  stage:
+    plugin_name: redsun-aht
+    plugin_id: asi-lx4000
+    service: stage_service
+  camera:
+    plugin_name: redsun-aht
+    plugin_id: spinnaker-camera
+    service: camera_service
+  illumination:
+    plugin_name: redsun-aht
+    plugin_id: lumencor-spectra
+    service: illumination_service
+  mcu:
+    plugin_name: redsun-aht
+    plugin_id: unified-emmsh
+    service: mcu_service
+
+metadata:
+  pending_camera_settings:
+    trigger_profile: "REPLACE_FLIR_TRIGGER_PROFILE"
+  deferred:
+    - FW-1000

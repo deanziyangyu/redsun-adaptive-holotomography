@@ -154,6 +154,7 @@ activemq-data/
 .env
 .envrc
 .venv
+.venv-redsun014/
 env/
 venv/
 ENV/
@@ -219,3 +220,19 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+tmp-archive-*/
+tmp/
+# Local-only, non-public research and validation scripts.
+/tmp/local_scripts/
+
+# Launcher scratch and relocated caches (scripts/run_session.ps1).
+.pva-tmp/
+.napari_cache/
+.redsun_data/
+.venv-uv-backup/
+
+# Pre-reset offline archive (RESTORE.md explains restoration).
+/.archive/
+
+# pytest tmp_path factory root, when a direct run leaves it in the checkout.
+pytest-of-*/

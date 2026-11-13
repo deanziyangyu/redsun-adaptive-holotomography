@@ -1,15 +1,56 @@
-services:
-  camera-ioc:
-    module: redsun_aht.services.camera_ioc
+# Redsun plugin manifest for the rebuilt AHT acquisition application.
+#
+# Every service is served over PVAccess. Channel Access services are not
+# declared and not supported, so no entry here starts one.
+#
+# A session profile names a service by `plugin_id` under `plugin_name:
+# redsun-aht`, which is this distribution's entry in the `redsun.plugins`
+# group (see pyproject.toml). A device, presenter or view id is named the same
+# way when a profile declares the component instead of a session class.
+
 devices:
-  camera-service: redsun_aht.device:CameraServiceDevice
-  dpct-stage: redsun_aht.device:DpctStageDevice
-  dpct-pattern: redsun_aht.device:DpctPatternDevice
-  dpct-detector-group: redsun_aht.device:DpctDetectorGroupDevice
+  asi-lx4000: redsun_aht.robotic.device.asi._service:AsiSerialStage
+  lumencor-spectra: redsun_aht.robotic.device.auxiliary:LumencorSpectra
+  unified-emmsh: redsun_aht.robotic.device.auxiliary:UnifiedEmmsh
+  mmcore-camera: redsun_aht.device.mmcore:MMCamera
+  spinnaker-camera: redsun_aht.device.spinnaker_camera:SpinnakerCamera
+  mmcore-stage: redsun_aht.device.mmcore:MMStage
+  arduino-led: redsun_aht.device.arduino.device:ArduinoLedDevice
+  unified-rotation: redsun_aht.device.pva_rotation:PvaRotationMotor
+  unified-mcu: redsun_aht.device.pva_unified_mcu:PvaUnifiedMcu
+
 presenters:
-  simulation-lifecycle: redsun_aht.presenter:SimulationLifecyclePresenter
-  offline-processing: redsun_aht.presenter:OfflineProcessingPresenter
+  detector: redsun_aht.presenter.detector:DetectorPresenter
+  acquisition: redsun_aht.presenter.acquisition:AcquisitionPresenter
+  dpct: redsun_aht.presenter.dpct:DpctPresenter
+
 views:
-  camera-acquisition: redsun_aht.view.camera:CameraAcquisitionWidget
-  multishot-scan: redsun_aht.view.multishot:MultishotScanWidget
-  processing: redsun_aht.view.processing:ProcessingWidget
+  detector: redsun_aht.view.detector:DetectorView
+  acquisition: redsun_aht.view.acquisition:AcquisitionView
+  image: redsun_aht.view.image:ImageView
+
+services:
+  mmcore-camera:
+    module: redsun_aht.services.mmcore_camera
+    ready: mmcore camera ready
+  spinnaker-camera:
+    module: redsun_aht.services.spinnaker_camera
+    ready: spinnaker camera ready
+  mmcore-stage:
+    module: redsun_aht.services.mmcore_stage
+    ready: mmcore stage ready
+  arduino-led:
+    module: redsun_aht.services.arduino_led
+    ready: arduino led ready
+  asi-lx4000:
+    module: redsun_aht.robotic.services.asi_stage
+    ready: native ASI serial stage ready
+  lumencor-spectra:
+    module: redsun_aht.robotic.services.lumencor_spectra
+    ready: Lumencor Spectra ready
+  unified-emmsh:
+    module: redsun_aht.robotic.services.unified_emmsh
+    ready: unified EMMSH ready
+  unified-mcu:
+    module: redsun_aht.services.unified_mcu
+    ready: unified MCU ready

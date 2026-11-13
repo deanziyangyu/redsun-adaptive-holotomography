@@ -1,0 +1,28 @@
+redsun-adaptive-holotomography
+Copyright 2026 the AHT contributors
+
+Licensed under the Apache License, Version 2.0 (the "License"); you may not use
+these files except in compliance with the License. A copy of the License is in
+the LICENSE file at the root of this repository.
+
+## Derived source
+
+Parts of this package are adapted from other Apache-2.0 licensed projects. The
+adapted files keep their original copyright notices, and each one names its
+donor and revision in the module docstring.
+
+| Donor | Revision used | What was adapted |
+|---|---|---|
+| `redsun-searching-is-imaging` (the IX83 imaging bundle) | `3a3bf06` on `feat/device_bundle_composition` | Session and profile composition, the FastCS MMCore camera and stage services, the camera and stage devices, the detector presenter's live stream and document routing, the detector and acquisition views, the preview adapters, the event and ring feeds, and the launcher. |
+| `redsun-planner` (`sample_search`) | `c0eff86` | The live-stream plan helpers (`prepare_live_stream`, `teardown_live_stream`, `collect_while_waiting_plan`, `live_stream`) and the `LiveFlyer` protocol, reimplemented in `redsun_aht.plans.live` rather than imported, so that the planner's broom and hand-eye modules stay out of this package's import graph. |
+| `redsun` | 0.16.0 | No source is copied. The package is a dependent, not a fork. |
+
+The robotic ASI service and its IX83-derived support code retain the donor attribution:
+Copyright 2025 - 2026 Leibniz-Institute of Photonic Technology. See
+`src/redsun_aht/robotic/IX83-SOURCES.md` for the source revisions and file identities.
+
+## Upstream projects
+
+- redsun: https://github.com/deanziyangyu/redsun
+- redsun-searching-is-imaging: https://github.com/deanziyangyu/redsun-searching-is-imaging
+- redsun-planner: https://github.com/deanziyangyu/redsun-planner

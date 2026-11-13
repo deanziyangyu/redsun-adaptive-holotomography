@@ -1,0 +1,67 @@
+# One camera, one stage and the 91-LED v1 Arduino panel, over PVAccess.
+#
+# The camera and the stage are Micro-Manager's DemoCamera adapter, so they need
+# no hardware. The Arduino service is different: it owns a serial port, and it
+# does not start without one. The `port` below is a PLACEHOLDER — `COM19` is the
+# historical MMStudio port recorded with the validated DPCT workflow, not a
+# portable default. Replace it with the port the sketch is attached to before
+# starting this profile, or the `led1` service exits and the session comes up
+# without illumination. `aht --list` and the headless tests never open it.
+#
+# The service names are also the device names (and, for the camera, the detector
+# id): `camera1`, `stage1` and `led1`, so the profile, the devices, the run
+# record and the log refer to the same identities. Each `prefix` is the PV
+# prefix its service serves and its device reads.
+#
+# `--prefix` is repeated inside the Arduino service's `args` because that
+# module's own command line requires it explicitly, unlike the mmcore services,
+# which take theirs from the session. The two values must agree.
+#
+# The limits are the stage service's declared travel bounds, not a measurement
+# of an instrument: replace them with measured bounds before a run whose
+# positions matter. The default DPCT action reads a fresh free-running camera
+# frame after each pattern; the MM ASCII 91 sketch emits no camera TTL.
+
+schema_version: 1.0
+session: aht-dpct
+
+services:
+  transport: pv-access
+  camera1:
+    plugin_name: redsun-aht
+    plugin_id: mmcore-camera
+    prefix: "AHT-CAM1:"
+    args:
+      adapter: DemoCamera
+      device: DCam
+      properties: Binning
+      initial-property: ["Binning=2"]
+  stage1:
+    plugin_name: redsun-aht
+    plugin_id: mmcore-stage
+    prefix: "AHT-XY:"
+    args:
+      adapter: DemoCamera
+      device: DXYStage
+      axes: x,y
+      limits: "x=-1000:1000,y=-500:500"
+  led1:
+    plugin_name: redsun-aht
+    plugin_id: arduino-led
+    prefix: "AHT-LED:"
+    args:
+      prefix: "AHT-LED:"
+      # Placeholder: the port the sketch is attached to, not a portable default.
+      port: COM19
+      baudrate: 9600
+
+presenters:
+  det_ctrl:
+    timeout: 2.0
+  acq_ctrl: {}
+  dpct_ctrl: {}
+
+views:
+  det_widget: {}
+  acq_widget: {}
+  img_widget: {}

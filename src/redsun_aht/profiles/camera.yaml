@@ -1,0 +1,39 @@
+# One editable camera, served over PVAccess.
+#
+# The packaged adapter is Micro-Manager's DemoCamera, so this profile runs with
+# no hardware. For the instrument, keep the service name and prefix and change
+# `adapter`/`device` to the camera Micro-Manager exposes (or replace both with
+# `mm-config` naming the system configuration). The service name is also the
+# detector id: `camera1` names the device, the detector and the data key, so a
+# plan and a run record refer to the same identity.
+#
+# The second detector is this file with a `camera2` service and device added;
+# `profiles/camera-dual.yaml` is that copy and `aht session camera
+# --detectors 2` uses it.
+
+schema_version: 1.0
+session: aht-camera
+
+services:
+  transport: pv-access
+  camera1:
+    plugin_name: redsun-aht
+    plugin_id: mmcore-camera
+    prefix: "AHT-CAM1:"
+    args:
+      adapter: DemoCamera
+      device: DCam
+      # Every writable camera property is published when this is left out;
+      # naming one narrows the settings tree to it.
+      properties: Binning
+      initial-property: ["Binning=2"]
+
+presenters:
+  det_ctrl:
+    timeout: 2.0
+  acq_ctrl: {}
+
+views:
+  det_widget: {}
+  acq_widget: {}
+  img_widget: {}

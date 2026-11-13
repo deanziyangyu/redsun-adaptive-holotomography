@@ -1,137 +1,71 @@
-"""Public structural contracts for AHT components and extensions."""
+"""Structural device contracts for the live-stream plan helpers.
+
+Adapted from ``redsun-planner`` (package ``sample_search``) at revision
+``c0eff86``, file ``src/planner/protocols.py``, Apache-2.0 licensed; copyright
+the ``redsun-planner`` contributors. The member docstrings keep the donor's
+meaning.
+
+Changed for :mod:`redsun_aht`:
+
+- :class:`LiveFlyer` also declares ``stage``/``unstage``, because the live
+  helpers unstage the detectors they were given, and ``stop``, because the
+  RunEngine stops the devices of an interrupted run. It is also readable,
+  because a stream declared with ``collect=False`` is described with
+  ``describe`` rather than ``describe_collect``.
+- ``XYMotor`` is not carried over: the donor's live-stream helper never needs
+  it. A later scan plan may add its own axis contract instead of importing this
+  module.
+
+Notes
+-----
+:class:`LiveFlyer` is the contract the live plans *accept*. An ophyd-async
+``StandardDetector`` has ``stage``/``unstage`` and ``read``/``describe`` but no
+``stop``; a device selector that must accept one unchanged should test a
+narrower protocol, while a camera that owns a ``stop`` can be a whole
+:class:`LiveFlyer`.
+"""
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Protocol, runtime_checkable
+from typing import Any, Protocol, runtime_checkable
 
-if TYPE_CHECKING:
-    from collections.abc import AsyncIterator, Mapping, Sequence
-
-    from bluesky.protocols import Status
-    from event_model import PartialEvent
-
-    from redsun_aht.domain import (
-        CalibrationArtifact,
-        DetectorCapabilities,
-        Frame,
-        HardwareServiceStatus,
-        Observation,
-        PoseSample,
-        ProcessingJob,
-    )
-    from redsun_aht.domain.models import JsonValue
+from bluesky.protocols import (
+    Collectable,
+    Flyable,
+    Preparable,
+    Readable,
+    Stageable,
+    Stoppable,
+    WritesStreamAssets,
+)
 
 
 @runtime_checkable
-class Detector(Protocol):
-    """Lifecycle contract for independently staged detectors."""
-
-    async def discover(self) -> DetectorCapabilities: ...
-
-    async def connect(self) -> None: ...
-
-    async def configure(self, settings: Mapping[str, JsonValue]) -> str: ...
-
-    async def arm(self) -> None: ...
-
-    async def trigger(self) -> None: ...
-
-    async def read(self) -> Frame: ...
-
-    async def stop(self) -> None: ...
-
-    async def disconnect(self) -> None: ...
-
-
-@runtime_checkable
-class SupervisedDetector(Detector, Protocol):
-    """Detector service surface used by discovery and reconnect supervision."""
+class LiveFlyer(
+    Readable[Any],
+    Stageable,
+    Preparable,
+    Flyable,
+    Collectable,
+    WritesStreamAssets,
+    Stoppable,
+    Protocol,
+):
+    """A Bluesky flyer that also exposes its live image buffer to a viewer."""
 
     @property
-    def service_id(self) -> str: ...
+    def name(self) -> str:
+        """Return the flyer's name."""
+        ...
 
     @property
-    def epics_prefix(self) -> str: ...
+    def buffer(self) -> Any:
+        """Return the live image buffer a viewer reads."""
+        ...
 
-    @property
-    def status(self) -> HardwareServiceStatus: ...
-
-
-@runtime_checkable
-class CompositeStage(Protocol):
-    """Named-axis motion interface with explicit units and cleanup."""
-
-    @property
-    def axes(self) -> Mapping[str, str]: ...
-
-    async def move(self, positions: Mapping[str, float]) -> PoseSample: ...
-
-    async def settle(self) -> PoseSample: ...
-
-    async def read(self) -> PoseSample: ...
-
-    async def stop(self) -> None: ...
+    def get_index(self) -> Any:
+        """Return the index of the newest frame in the buffer."""
+        ...
 
 
-@runtime_checkable
-class MotionValidator(Protocol):
-    """Public seam implemented by a future robotic safety extension."""
-
-    async def authorize(
-        self, current: PoseSample, requested: PoseSample
-    ) -> tuple[bool, str]: ...
-
-
-@runtime_checkable
-class RemoteReconstructionProvider(Protocol):
-    """Loose remote-processing seam; never a staged base-package device."""
-
-    async def submit(self, job: ProcessingJob) -> str: ...
-
-    async def status(self, remote_job_id: str) -> Mapping[str, JsonValue]: ...
-
-    async def cancel(self, remote_job_id: str) -> None: ...
-
-
-@runtime_checkable
-class SolverPlugin(Protocol):
-    """Detached numerical solver contract."""
-
-    @property
-    def plugin_id(self) -> str: ...
-
-    async def prepare(self, calibrations: Sequence[CalibrationArtifact]) -> None: ...
-
-    async def run(
-        self, job: ProcessingJob
-    ) -> AsyncIterator[Mapping[str, JsonValue]]: ...
-
-    async def cancel(self, job_id: str) -> None: ...
-
-
-@runtime_checkable
-class ProcessingFlyer(Protocol):
-    """Run-coupled lifecycle adapter; kernels execute in detached workers."""
-
-    def prepare(self, job: ProcessingJob) -> Status: ...
-
-    def kickoff(self) -> Status: ...
-
-    async def accept(self, observation: Observation) -> None: ...
-
-    def complete(self) -> Status: ...
-
-    def collect(self) -> AsyncIterator[PartialEvent]: ...
-
-    def stop(self) -> Status: ...
-
-
-__all__ = [
-    "CompositeStage",
-    "Detector",
-    "MotionValidator",
-    "ProcessingFlyer",
-    "RemoteReconstructionProvider",
-    "SolverPlugin",
-    "SupervisedDetector",
-]
+__all__ = ["LiveFlyer"]
