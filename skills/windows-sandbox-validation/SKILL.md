@@ -10,8 +10,8 @@ description: Compose, run and interpret a Windows test or validation command in 
 Running tests, linters and bounded validation commands on this Windows host and
 reporting what they establish. Covers DSH agent sessions and a normal host PowerShell;
 not instrument rehearsal or hardware qualification. Read [AGENTS.md](../../AGENTS.md),
-[Windows test execution](../../docs/windows_test_execution.md) and
-[testing.md](../../docs/testing.md) before composing a command.
+[headless testing](../../docs/index.md#testing) and
+[headless testing](../../docs/index.md#testing) before composing a command.
 
 ## Preconditions
 
@@ -28,14 +28,14 @@ not instrument rehearsal or hardware qualification. Read [AGENTS.md](../../AGENT
    `mkdir` shim, napari cache override, `pymmcore_plus` log path and CuPy caches.
 
    ```powershell
-   pwsh -NoProfile -File scripts/dsh/run-tests.ps1 tests/test_multilayer.py -q
+   pwsh -NoProfile -File scripts/dsh/run-tests.ps1 tests/test_contracts_frames.py -q
    ```
 
 2. **Pick the narrowest selection that answers the question** and name it in the
    report; a whole-suite pass is not needed for a documentation change, and one
    file is not evidence for the suite.
 3. **Read the failure before calling it a failure.** Per the classification table
-   in [Windows test execution](../../docs/windows_test_execution.md#environment-fault-or-test-failure),
+   in [headless testing](../../docs/index.md#testing),
    fixture-setup `PermissionError`, cache denials and CuPy stalls are
    environmental; an executed assertion or numerical comparison is a test
    failure.

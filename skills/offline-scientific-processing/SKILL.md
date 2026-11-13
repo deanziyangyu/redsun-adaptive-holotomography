@@ -10,8 +10,7 @@ description: Run a hardware-free AHT reconstruction or replay from recorded data
 Reconstruction, replay and RI analysis with no session, device handle or network: a
 verified DPCT bundle on disk, or a declared-axis TIFF plus a reconstruction
 configuration. Read [AGENTS.md](../../AGENTS.md), [the
-handbook](../../docs/agent-handbook.md) and [Windows test
-execution](../../docs/windows_test_execution.md) first.
+handbook](../../AGENTS.md) and [headless testing](../../docs/index.md#testing) first.
 
 ## Preconditions
 
@@ -65,7 +64,7 @@ Refuse, naming the failed precondition, rather than improvising:
 - Re-running on the same inputs reproduces the product within the stated
   tolerance; say whether determinism was checked.
 - The guard tests pass with their actual count, e.g.
-  `pwsh -NoProfile -File scripts/dsh/run-tests.ps1 tests/test_multilayer.py tests/test_direct_tiff.py -q`.
+  `pwsh -NoProfile -File scripts/dsh/run-tests.ps1 <test-module> -q`.
 - Record: command and working directory; interpreter and resolved environment;
   solver and backend used; product names, shapes and dtypes with the
   configuration that produced them; the tolerance basis with its numbers.

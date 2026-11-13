@@ -2,12 +2,19 @@
 
 Redsun Adaptive Holotomography (AHT) is the acquisition application for an adaptive
 multimodal holotomographic microscope. It is built on
-[Redsun](https://github.com/redsun-acquisition/redsun) 0.16 and serves every device over
+[Redsun](https://github.com/redsun-acquisition/redsun) and serves every device over
 PVAccess: there is no Channel Access client, server or dependency in this package.
 
-The application is being rebuilt on the basis of the IX83 imaging bundle. The acquisition
-core is new; the scientific reconstruction methods and the historical datasets are handled
-separately and are not imported by the acquisition runtime.
+AHT includes acquisition plans, run-document routing, and frame storage.
+Instrument profiles select the devices and services for each setup.
+
+| Selector | Packaged profile | Device stack |
+|---|---|---|
+| `holospim` | [holospim.yaml](src/redsun_aht/profiles/holospim.yaml) | MMCore camera and survey stage, plus ESP32-S3 MCU for X28 fast Z, LED and rotation |
+| `arh` | [arh_system.yaml](src/redsun_aht/profiles/arh_system.yaml) | ASI LX4000 XYZ, FLIR via Spinnaker, Lumencor Spectra via MMCore, and Arduino Due MCU |
+
+Both profiles use the same AHT installation. Keep host-specific settings in
+an overlay on each instrument machine.
 
 ## Status
 
@@ -25,34 +32,39 @@ What is implemented and exercised by the headless suite:
 - a MM-compatible Arduino illumination service over `oxiserial`, with an uncertain outcome
   reported rather than resent.
 
-The acquisition page, detector selection controls, image view and DPCT plan entry are
-present but have not had a host GUI acceptance run. The `AHT-MM-ASCII-91/1` sketch
-supplies the two-digit command dialect without camera TTL. Optical pattern shape and
-camera association require instrument qualification. The Arduino service requires
-the sketch's `90` identity response before serving commands. Live camera capture
-now writes a checksummed manifest through `RunFrameStore`; its run and detector
-identity are supplied when assembling a receipt. The software DPCT plan binds
-those identities when it opens its own store. No full hardware DPCT run has been
-accepted yet.
+The headless suite exercises synthetic and fake-device paths. Physical camera,
+illumination, stage and trigger behavior require qualification for each setup.
+See the [architecture and capability notes](docs/index.md).
 
 ## Install
 
 ```console
-uv sync --extra all --locked
+uv sync --locked
+# For the camera GUI and MMCore support:
+uv sync --locked --extra all
 ```
 
 ## Run
 
-```console
-pwsh -NoProfile -File scripts/run_session.ps1 -Check   # resolve and prove writable roots
-pwsh -NoProfile -File scripts/run_session.ps1 --list   # sessions and services
-pwsh -NoProfile -File scripts/run_session.ps1 service mmcore-camera -- --prefix AHT-CAM1:
-pwsh -NoProfile -File scripts/run_session.ps1 session camera
+On Windows, use the [PowerShell launcher](scripts/README.md).
+
+```powershell
+pwsh -NoProfile -File scripts/run_session.ps1 -Check
+pwsh -NoProfile -File scripts/run_session.ps1 --list
+pwsh -NoProfile -File scripts/run_session.ps1 session profile arh --check
+pwsh -NoProfile -File scripts/run_session.ps1 session profile holospim --check
 ```
 
-`aht` is the direct entry point; the PowerShell wrapper resolves the repository, picks a
-writable data root and a short temporary root for PVA, and exports the cache and loopback
-settings a session needs.
+The profile checks build mock devices and shut down without launching services.
+Pass `--overlay <path>` to layer host settings over the packaged profile.
+`--check` forces mock mode even if an overlay sets `mock: false`. The direct CLI
+uses a separator before profile arguments, for example
+`aht session profile -- arh --check`.
+
+For host deployment, install the `camera-mmcore` extra and the matching
+Micro-Manager adapters used by the profile. ARH also needs the vendor PySpin
+wheel for its FLIR service. The `profile` command builds a headless device
+session. The `camera` and `dpct` commands are separate GUI entry points.
 
 ## DPCT plan
 

@@ -3,7 +3,7 @@
 Repository-relative Windows test runner. It contains no machine-specific path: the
 repository root comes from `$PSScriptRoot`, so a clone anywhere works, from any current
 directory. Failure modes and verification steps are in
-[docs/windows_test_execution.md](../../docs/windows_test_execution.md).
+[headless testing](../../docs/index.md#testing).
 
 ## Usage
 
@@ -13,7 +13,7 @@ pwsh -NoProfile -File scripts/dsh/run-tests.ps1 tests/test_contracts_frames.py -
 
 # a keyword selection, or a marker group
 pwsh -NoProfile -File scripts/dsh/run-tests.ps1 tests -q -k contracts
-pwsh -NoProfile -File scripts/dsh/run-tests.ps1 -m integration tests/integration
+pwsh -NoProfile -File scripts/dsh/run-tests.ps1 -m integration tests
 
 # keep the heavy temp trees for a post-mortem
 pwsh -NoProfile -File scripts/dsh/run-tests.ps1 tests -q -KeepArtifacts
@@ -73,5 +73,5 @@ Keep the log when the run is evidence; do not treat basetemp contents as evidenc
 
 ## Related
 
-[windows_test_execution.md](../../docs/windows_test_execution.md) ·
-[testing.md](../../docs/testing.md)
+[headless testing](../../docs/index.md#testing) ·
+[headless testing](../../docs/index.md#testing)

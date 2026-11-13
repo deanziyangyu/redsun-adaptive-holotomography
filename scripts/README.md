@@ -16,7 +16,7 @@ Run it from anywhere; it resolves the repository from `$PSScriptRoot` and uses
 .\scripts\run_session.ps1 session <name>              # run one session
 .\scripts\run_session.ps1 service <name>              # run one PVA service
 .\scripts\run_session.ps1 session <name> --prefix AHT:CAM:PVCAM:
-.\scripts\run_session.ps1 -DataRoot E:\redsun-aht-data session <name>
+.\scripts\run_session.ps1 -DataRoot .\aht-data session <name>
 ```
 
 Everything after `Command` is forwarded. Do **not** insert the `--` separator
@@ -38,10 +38,7 @@ The wrapper exports:
 | `EPICS_PVA_ADDR_LIST` | `127.0.0.1` |
 | `EPICS_PVA_AUTO_ADDR_LIST` | `NO` |
 
-The data root defaults to `R:\redsun_aht_data`. If that drive refuses writes,
-the wrapper falls back to `<repository>\.redsun_data` and prints the fallback.
-An explicit `-DataRoot` or inherited `REDSUN_DATA_ROOT` is never replaced: it is
-refused with its exact path when unwritable.
+Use `-DataRoot` or `REDSUN_DATA_ROOT` to select a writable directory. The wrapper reports when it uses the checkout-local fallback.
 
 ## `scripts/launch_app.py` — the bootstrap
 
@@ -70,11 +67,7 @@ aht session <name> -- <arguments>
 aht service <name> -- <arguments>
 ```
 
-`--list` prints the configured sessions and services. Until the coordinator
-adds `registry()` to `redsun_aht.configurations`, both sections print
-`no sessions registered yet` / `no services registered yet`, and dispatch is
-unavailable. `aht --check` probes the repository, data root, temporary root,
-napari cache and Redsun data root.
+`--list` prints the registered sessions and services. `aht --check` probes the repository, data root, temporary root, napari cache and Redsun data root.
 
 ### Registry contract
 
@@ -96,13 +89,8 @@ stays headless.
 `NOT WRITABLE` is the one to fix.
 
 - **`data root ... NOT WRITABLE`** — pass `-DataRoot` pointing at a writable
-  volume, or repair the ACL on the exact path in the message. The default
-  `R:\redsun_aht_data` falls back to the checkout, so a failure here usually
-  means the fallback is also unwritable.
-- **`redsun data ... NOT WRITABLE`** — you ran `aht --check` directly. On this
-  host `%LOCALAPPDATA%\redsun` refuses writes; run
-  `.\scripts\run_session.ps1 -Check`, which relocates Redsun's root before the
-  check.
+  volume.
+- **`redsun data ... NOT WRITABLE`** — use the PowerShell wrapper to relocate the Redsun data root.
 - **`temp root ... NO short writable temporary root found`** or
   **`pva ... event base FAILS`** — `p4p`/libevent needs a writable `TEMP` no
   longer than about 90 characters. Set `TMP`/`TEMP` to such a path, or let the
@@ -110,5 +98,4 @@ stays headless.
 - **`napari cache ... NOT WRITABLE`** — delete the directory or set
   `REDSUN_NAPARI_CACHE` to a writable path. napari rebuilds its theme SVGs, so
   an empty directory is fine.
-- **`aht: error: unknown session ...`** — run `--list`; the registry belongs to
-  the coordinator and may still be empty.
+- **`aht: error: unknown session ...`** — run `--list` to see the registered names.

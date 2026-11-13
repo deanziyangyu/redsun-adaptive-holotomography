@@ -6,8 +6,8 @@ serials, incident logs or internal programme references.
 
 ## Read first
 
-- [docs/testing.md](docs/testing.md) — suite layout and marker groups.
-- [docs/examples.md](docs/examples.md) — executable hardware-free examples.
+- [headless testing](docs/index.md#testing) — suite layout and marker groups.
+- [headless testing](docs/index.md#testing) — executable hardware-free examples.
 - [scripts/dsh/README.md](scripts/dsh/README.md) — the repository-relative runner.
 - [skills/README.md](skills/README.md) — repository-local agent skills.
 
@@ -17,7 +17,7 @@ environment the recipes require.
 
 **Headless only.** An agent session must never construct a Qt `QApplication` or a
 napari viewer, and must never run the GUI test modules or `scripts/*qt*.py`. The
-excluded files and the compliance check are in [docs/testing.md](docs/testing.md).
+excluded files and the compliance check are in [headless testing](docs/index.md#testing).
 
 ## Tests and temporary files
 
