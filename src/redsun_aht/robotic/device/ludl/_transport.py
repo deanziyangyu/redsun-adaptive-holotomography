@@ -234,24 +234,34 @@ class OxiSerialSession:
             )
         async with self._exchange_lock:
             self._frame_stream_usable = False
-            write_started_ns = self._monotonic_ns()
-            written = await self._port.write(request)
-            write_finished_ns = self._monotonic_ns()
-            if written != len(request):
-                raise OSError(f"Short serial write: {written}/{len(request)} bytes")
-            read_started_ns = self._monotonic_ns()
-            response = await self._port.read_until(expected=terminator)
-            read_finished_ns = self._monotonic_ns()
-            if not response:
-                raise TimeoutError("No serial response before the configured timeout")
-            return SerialExchange(
-                request_length=len(request),
-                response=response,
-                write_call_started_ns=write_started_ns,
-                write_call_finished_ns=write_finished_ns,
-                read_call_started_ns=read_started_ns,
-                read_call_finished_ns=read_finished_ns,
-            )
+            # Once a request starts, drain its reply before another caller can
+            # use this serial stream, including when FastCS cancels a scan.
+            exchange = asyncio.create_task(self._request_reply(request, terminator))
+            try:
+                return await asyncio.shield(exchange)
+            except asyncio.CancelledError:
+                await asyncio.gather(exchange, return_exceptions=True)
+                raise
+
+    async def _request_reply(self, request: bytes, terminator: bytes) -> SerialExchange:
+        write_started_ns = self._monotonic_ns()
+        written = await self._port.write(request)
+        write_finished_ns = self._monotonic_ns()
+        if written != len(request):
+            raise OSError(f"Short serial write: {written}/{len(request)} bytes")
+        read_started_ns = self._monotonic_ns()
+        response = await self._port.read_until(expected=terminator)
+        read_finished_ns = self._monotonic_ns()
+        if not response:
+            raise TimeoutError("No serial response before the configured timeout")
+        return SerialExchange(
+            request_length=len(request),
+            response=response,
+            write_call_started_ns=write_started_ns,
+            write_call_finished_ns=write_finished_ns,
+            read_call_started_ns=read_started_ns,
+            read_call_finished_ns=read_finished_ns,
+        )
 
     async def read_line(self) -> bytes:
         """Read a follow-up ASCII line without sending another command."""

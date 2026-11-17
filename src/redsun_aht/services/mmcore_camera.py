@@ -982,13 +982,13 @@ class MMCameraController(Controller):  # type: ignore[misc]
             frame = self._latest
             if frame is None or grabbed == self._published:
                 return
-            self._published = grabbed
             if tuple(frame.shape) != self.buffer.datatype.shape:
                 await self.publish_layout(frame)
             else:
                 await self.follow_layout(frame)
                 await self.buffer.update(frame)
             await self.frame_count.update(grabbed)
+            self._published = grabbed
             await self._publish_setting_latency_updates()
             if self.captured.get() != self._written:
                 await self.captured.update(self._written)

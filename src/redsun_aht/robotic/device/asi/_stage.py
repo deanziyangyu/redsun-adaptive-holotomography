@@ -131,6 +131,7 @@ class AsiXYStage:
             raise ValueError("counts per micrometre must be finite and positive")
         self._client = client
         self._counts_per_um = float(counts_per_um)
+        self.travel_bounds_enabled = True
         self._max_xy_offset_um = float(max_xy_offset_um)
         self._move_timeout_s = float(move_timeout_s)
         self._poll_period_s = float(poll_period_s)
@@ -235,6 +236,17 @@ class AsiXYStage:
         )
 
     @property
+    def xy_limits_um(self) -> dict[str, tuple[float, float]]:
+        """Return the startup-relative command interval for each XY axis."""
+        if self._origin_xy_um is None:
+            raise RuntimeError("call connect() before reading travel limits")
+        limit = self._max_xy_offset_um
+        return {
+            axis: (origin - limit, origin + limit)
+            for axis, origin in zip(("x", "y"), self._origin_xy_um, strict=True)
+        }
+
+    @property
     def calibration_metadata(self) -> dict[str, dict[str, int | float]]:
         """Return the fixed unit convention and the captured reference sample."""
         if self._origin_tenths is None or self._origin_xy_um is None:
@@ -281,7 +293,7 @@ class AsiXYStage:
         _require_xy(target_xy_um, "XY target")
         async with self._move_lock:
             target = (float(target_xy_um[0]), float(target_xy_um[1]))
-            self._require_in_envelope(target)
+            self._bounded_target_counts(target)
             approach = self._absolute_takeup_approach(target)
             if approach is not None:
                 logger.info(
@@ -289,6 +301,21 @@ class AsiXYStage:
                 )
                 await self._move_xy_locked(approach)
             return await self._move_xy_locked(target)
+
+    async def move_axis(self, axis: str, value: float) -> tuple[float, float]:
+        """Move only the selected lateral axis, without re-commanding its partner."""
+        if axis not in ("x", "y"):
+            raise ValueError(f"Unsupported lateral axis {axis!r}")
+        async with self._move_lock:
+            current = await self.read_xy()
+            target = (value, current[1]) if axis == "x" else (current[0], value)
+            self._bounded_target_counts(target)
+            approach = self._absolute_takeup_approach(target)
+            index = 0 if axis == "x" else 1
+            if approach is not None and approach[index] != target[index]:
+                point = (approach[0], target[1]) if axis == "x" else (target[0], approach[1])
+                await self._move_xy_locked(point, axis=axis.upper())
+            return await self._move_xy_locked(target, axis=axis.upper())
 
     async def move_relative_xy(
         self, delta_xy_um: tuple[float, float]
@@ -341,18 +368,14 @@ class AsiXYStage:
             self._client.close()
 
     async def _move_xy_locked(
-        self, target_xy_um: tuple[float, float]
+        self, target_xy_um: tuple[float, float], *, axis: str | None = None,
     ) -> tuple[float, float]:
         if self._origin_xy_um is None:
             raise RuntimeError("call connect() before requesting stage motion")
-        self._require_in_envelope(target_xy_um)
+        target_tenths = self._bounded_target_counts(target_xy_um)
         previous = self._last_commanded_xy_um
         self._halt_requested.clear()
         self._record_commanded_move(target_xy_um)
-        target_tenths = (
-            quantize_tenths(target_xy_um[0], self._counts_per_um),
-            quantize_tenths(target_xy_um[1], self._counts_per_um),
-        )
         logger.info(
             f"move_xy target counts={target_tenths} um={target_xy_um} "
             f"counts_per_um={self._counts_per_um}"
@@ -376,8 +399,9 @@ class AsiXYStage:
             unchanged = tuple(
                 target_tenths[index] == previous_tenths[index] for index in (0, 1)
             )
-        if unchanged is not None and unchanged[0] != unchanged[1]:
+        if axis is None and unchanged is not None and unchanged[0] != unchanged[1]:
             axis = "X" if not unchanged[0] else "Y"
+        if axis is not None:
             index = 0 if axis == "X" else 1
             logger.info(f"move_xy single-axis {axis} (the other axis is already there)")
             await self._client.move_axis_tenths(axis, target_tenths[index])
@@ -432,7 +456,7 @@ class AsiXYStage:
             point = target_xy_um[index] - math.copysign(takeup_um, step)
             low = origin[index] - self._max_xy_offset_um
             high = origin[index] + self._max_xy_offset_um
-            clamped = min(max(point, low), high)
+            clamped = min(max(point, low), high) if self.travel_bounds_enabled else point
             if clamped != point:
                 logger.warning(
                     f"absolute take-up for {axis} towards "
@@ -543,10 +567,23 @@ class AsiXYStage:
             # Continue observing the same move; never reissue it.
             await self._sleep(min(self._poll_period_s, remaining))
 
+    def _bounded_target_counts(self, target_xy_um: tuple[float, float]) -> tuple[int, int]:
+        self._require_in_envelope(target_xy_um)
+        x, y = target_xy_um
+        counts = (
+            quantize_tenths(x, self._counts_per_um),
+            quantize_tenths(y, self._counts_per_um),
+        )
+        self._require_in_envelope((
+            tenths_to_um(counts[0], self._counts_per_um),
+            tenths_to_um(counts[1], self._counts_per_um),
+        ))
+        return counts
+
     def _require_in_envelope(self, target_xy_um: tuple[float, float]) -> None:
         if self._origin_xy_um is None:
             raise RuntimeError("call connect() before requesting stage motion")
-        if any(
+        if self.travel_bounds_enabled and any(
             abs(target - origin) > self._max_xy_offset_um
             for target, origin in zip(target_xy_um, self._origin_xy_um, strict=True)
         ):

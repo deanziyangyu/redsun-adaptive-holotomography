@@ -113,7 +113,9 @@ class AsiXYClient:
 
     async def halt_xy(self) -> None:
         """Issue the controller's paired XY halt."""
-        await self._query("2HHALT")
+        reply = await self._query("2HHALT")
+        if reply != ":A":
+            raise RuntimeError(f"unexpected ASI XY halt reply: {reply!r}")
 
     async def read_speed_mm_s(self, axis: str) -> float:
         """Read the configured run speed in mm/s."""
@@ -149,8 +151,9 @@ class AsiXYClient:
 
     async def read_backlash_mm(self, axis: str) -> float:
         """Read the configured anti-backlash distance in millimetres."""
-        axis = _axis(axis)
-        response = await self._query(f"2HB {axis}?")
+        axis = "Z" if axis in ("z", "Z") else _axis(axis)
+        card = 1 if axis == "Z" else 2
+        response = await self._query(f"{card}HB {axis}?")
         match = _BACKLASH_VALUE.search(response)
         if match is None:
             raise ValueError(f"expected ASI {axis} backlash reply, got {response!r}")

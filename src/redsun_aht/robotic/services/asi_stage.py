@@ -9,6 +9,7 @@ positions in micrometres. Optional Z uses the pyhololab donor's separate
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 import argparse
 import asyncio
 import json
@@ -18,14 +19,15 @@ import time
 from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
-from fastcs.attributes import AttributeIO, AttrR, AttrRW, AttrW
+from fastcs.attributes import AttributeIO, AttrR, AttrRW, AttrW, AttributeIORef
 from fastcs.controllers import Controller
-from fastcs.datatypes import Bool, String
+from fastcs.datatypes import Bool, Float, Int, String
 from fastcs.logging import logger
 from redsun.services import configure_logging
 
 from redsun_aht.robotic.device.asi._client import TENTHS_PER_UM, AsiXYClient
-from redsun_aht.robotic.device.asi._stage import AsiXYStage, tenths_to_um
+from redsun_aht.robotic.device.asi._stage import AsiXYStage, quantize_tenths, tenths_to_um
+from redsun_aht.robotic.device.fw1000_ascii import LX4000FilterWheel
 from redsun_aht.robotic.device.ludl._transport import OxiSerialSession
 from redsun_aht.robotic.services._process import (
     controller_id,
@@ -145,9 +147,17 @@ class AsiAxisIO(LudlSerialStageIO):
             async with self._z_command_lock:
                 await self._client.halt_z()
 
+    async def _move_axis(self, axis: str, value: float) -> tuple[float, float]:
+        return await self._stage.move_axis(axis, value)
+
     async def send(self, attr: AttrW[float, AxisRef], value: float) -> None:
         if self._closing:
             raise RuntimeError("ASI stage service is shutting down")
+        if self._z_faulted:
+            async with self._axis_lock:
+                if self._z_faulted:
+                    await self.verify_z_stopped()
+                    self.outcome = "stopped"
         if attr.io_ref.axis != "z":
             await super().send(attr, value)
             return
@@ -156,16 +166,13 @@ class AsiAxisIO(LudlSerialStageIO):
         origin, limit = self._z_origin_um, self._max_z_offset_um
         if origin is None or limit is None:
             raise RuntimeError("Z requires a configured travel envelope and startup readback")
-        if abs(value - origin) > limit:
+        if self._stage.travel_bounds_enabled and abs(value - origin) > limit:
             raise ValueError("Z target exceeds the startup-relative travel envelope")
         raw_target = value * self._z_counts_per_um
         if not math.isfinite(raw_target):
             raise ValueError("Z target cannot be represented in controller counts")
-        target = int(raw_target)
-        # The legacy ASIXYStage skips absolute counts whose last digit is 3.
-        if abs(target) % 10 == 3:
-            target += 1
-        if abs(target / self._z_counts_per_um - origin) > limit:
+        target = quantize_tenths(value, self._z_counts_per_um)
+        if self._stage.travel_bounds_enabled and abs(target / self._z_counts_per_um - origin) > limit:
             raise ValueError("Z target exceeds the startup-relative travel envelope")
 
         generation = self._z_stop_generation
@@ -184,7 +191,7 @@ class AsiAxisIO(LudlSerialStageIO):
                         raise RuntimeError("ASI Z is already moving")
                     await self._client.move_z_counts(target)
                 except BaseException:
-                    await self._latch_z_fault()
+                    await self._recover_z_after_failure()
                     raise
             try:
                 deadline = time.monotonic() + 60.0
@@ -196,29 +203,44 @@ class AsiAxisIO(LudlSerialStageIO):
                     if time.monotonic() >= deadline:
                         raise TimeoutError("ASI Z did not become idle")
                     await asyncio.sleep(self._poll_period_s)
-                actual = await self._read_z_um()
+                actual_counts = await self._client.read_z_counts()
+                actual = actual_counts / self._z_counts_per_um
                 if generation != self._z_stop_generation:
                     raise RuntimeError("ASI Z move interrupted by stop")
-                if abs(actual - target / self._z_counts_per_um) > 1 / self._z_counts_per_um:
-                    raise RuntimeError("ASI Z stopped outside one count of its target")
+                if not math.isfinite(actual) or abs(actual_counts - target) > 1:
+                    raise RuntimeError(
+                        f"ASI Z stopped outside one count of its target "
+                        f"(read {actual_counts:g}, target {target})"
+                    )
                 if isinstance(attr, AttrR):
                     await attr.update(actual)
                 self.outcome = "completed"
             except BaseException:
-                await self._latch_z_fault()
+                await self._recover_z_after_failure()
                 raise
             finally:
                 self.busy = self._z_faulted
 
-    async def _latch_z_fault(self) -> None:
+    async def _recover_z_after_failure(self) -> None:
         self._z_faulted = True
         self.busy = True
         self.outcome = "unknown"
         # The caller holds axis I/O and may still hold the Z submission lock.
         try:
             await self._client.halt_z()
+            await self.verify_z_stopped()
         except Exception:
-            logger.exception("ASI Z halt failed after a move fault")
+            logger.exception("ASI Z stop could not be verified after a move fault")
+
+    async def verify_z_stopped(self) -> None:
+        deadline = time.monotonic() + 2.0
+        while await self._client.is_busy_z():
+            if time.monotonic() >= deadline:
+                raise RuntimeError("ASI Z still reports motion two seconds after halt")
+            await asyncio.sleep(self._poll_period_s)
+        await self._read_z_um()
+        self._z_faulted = False
+        self.busy = False
 
     async def update(self, attr: AttrR[float, AxisRef]) -> None:
         if self._closing:
@@ -245,8 +267,10 @@ class AsiStopIO(LudlStopIO):
             await super().send(attr, value)
         finally:
             await self._asi_axis_io.halt_z()
-            if self._asi_axis_io._z_faulted:
-                self._asi_axis_io.outcome = "unknown"
+            async with self._asi_axis_io._axis_lock:
+                if self._asi_axis_io._z_faulted:
+                    await self._asi_axis_io.verify_z_stopped()
+                    self._asi_axis_io.outcome = "stopped"
 
 
 class AsiProfileIO(AttributeIO[str, MotionProfileRef]):
@@ -258,6 +282,7 @@ class AsiProfileIO(AttributeIO[str, MotionProfileRef]):
         axis_io: LudlSerialStageIO,
         *,
         maximum_speed_mm_s: float,
+        include_z: bool = False,
     ) -> None:
         super().__init__()
         if (
@@ -270,6 +295,7 @@ class AsiProfileIO(AttributeIO[str, MotionProfileRef]):
         self._client = client
         self._axis_io = axis_io
         self._maximum_speed_mm_s = float(maximum_speed_mm_s)
+        self._include_z = include_z
 
     async def update(self, attr: AttrR[str, MotionProfileRef]) -> None:
         """Read both axis speeds, ramp times and backlash values."""
@@ -373,7 +399,67 @@ class AsiProfileIO(AttributeIO[str, MotionProfileRef]):
                 "ramp_ms": await self._client.read_ramp_ms(axis),
                 "backlash_mm": await self._client.read_backlash_mm(axis),
             }
+        if self._include_z:
+            result["z"] = {"backlash_mm": await self._client.read_backlash_mm("z")}
         return result
+
+
+class WheelRef(AttributeIORef):
+    pass
+
+
+class WheelIO(AttributeIO[bool | int, WheelRef]):
+    """Expose wheel status and a write-only slot request over PVA."""
+
+    def __init__(self, wheel: LX4000FilterWheel) -> None:
+        super().__init__()
+        self._wheel = wheel
+        self.last_slot = AttrR(Int(), description="Last completed slot request, or -1 if unknown")
+
+    async def update(self, attr: AttrR) -> None:
+        await attr.update(await self._wheel.busy())
+
+    async def send(self, attr: AttrW, value: int) -> None:
+        if type(value) is not int or not 0 <= value <= 7:
+            raise ValueError("Filter slot must be in 0..7")
+        await self.last_slot.update(-1)
+        await self._wheel.move(value)
+        await self.last_slot.update(value)
+
+
+class AsiWheelController(Controller):
+    def __init__(self, wheel: LX4000FilterWheel) -> None:
+        self._wheel_io = WheelIO(wheel)
+        super().__init__(ios=[self._wheel_io])
+        self.busy = AttrR(Bool(), io_ref=WheelRef(update_period=0.5))
+        self.last_slot = self._wheel_io.last_slot
+        self.slot = AttrW(
+            Int(), io_ref=WheelRef(),
+            description="Zero-based filter slot request, completed after controller idle",
+        )
+
+    async def connect(self) -> None:
+        await self.last_slot.update(-1)
+        await self._wheel_io.update(self.busy)
+        await super().connect()
+
+
+@dataclass
+class TravelBoundsRef(AttributeIORef):
+    pass
+
+
+class TravelBoundsIO(AttributeIO[bool, TravelBoundsRef]):
+    def __init__(self, stage, axis_io):
+        super().__init__()
+        self.stage = stage
+        self.axis_io = axis_io
+
+    async def send(self, attr, value):
+        async with self.axis_io._axis_lock:
+            if self.axis_io.busy or self.axis_io._closing:
+                raise RuntimeError("ASI stage must be idle to change travel bounds")
+            self.stage.travel_bounds_enabled = value
 
 
 class AsiStageController(Controller):
@@ -399,9 +485,9 @@ class AsiStageController(Controller):
         if max_z_offset_um is not None and (
             isinstance(max_z_offset_um, bool)
             or not math.isfinite(max_z_offset_um)
-            or max_z_offset_um <= 0
+            or not 0 < max_z_offset_um <= 1000.0
         ):
-            raise ValueError("Z travel envelope must be finite and positive")
+            raise ValueError("Z travel envelope must be in (0, 1000] um")
         if (
             isinstance(z_counts_per_um, bool)
             or not math.isfinite(z_counts_per_um)
@@ -436,6 +522,7 @@ class AsiStageController(Controller):
             client,
             axis_io,
             maximum_speed_mm_s=maximum_speed_mm_s,
+            include_z="z" in axes,
         )
         telemetry_io = StageTelemetryIO()
         super().__init__(
@@ -467,8 +554,10 @@ class AsiStageController(Controller):
         stage_controller.add_sub_controller("axis", group)
         self.add_sub_controller(STAGE_GROUP, stage_controller)
 
+        bounds_io = TravelBoundsIO(stage, axis_io)
         motion = Controller(
             ios=[
+                bounds_io,
                 stop_io,
                 state_io,
                 traverse_io,
@@ -477,6 +566,7 @@ class AsiStageController(Controller):
                 telemetry_io,
             ]
         )
+        motion.travel_bounds = AttrW(Bool(), io_ref=TravelBoundsRef())
         motion.stop = AttrW(
             Bool(), io_ref=StopRef(), description="Halt ASI XY and enabled Z"
         )
@@ -514,13 +604,21 @@ class AsiStageController(Controller):
                 "Host-bracketed sampled ASI XY readbacks; not exposure-synchronized"
             ),
         )
+        motion.z_limits = AttrR(String(), description="Startup-relative Z interval in micrometres")
+        motion.xy_limits = AttrR(String(), description="Startup-relative X and Y intervals in micrometres")
+        motion.z_counts_per_um = AttrR(Float(), description="Z controller counts per micrometre")
         self.add_sub_controller("motion", motion)
 
     async def connect(self) -> None:
         """Handshake, capture the origin, start sampled telemetry."""
         try:
             origin = await self._stage.connect()
+            await self.motion.xy_limits.update(json.dumps(self._stage.xy_limits_um))
             await self._axis_io.capture_z_origin()
+            z_origin, z_limit = self._axis_io._z_origin_um, self._axis_io._max_z_offset_um
+            if z_origin is not None and z_limit is not None:
+                await self.motion.z_counts_per_um.update(self._axis_io._z_counts_per_um)
+                await self.motion.z_limits.update(json.dumps([z_origin - z_limit, z_origin + z_limit]))
             if self._axis_io.busy:
                 controller_busy = await self._stage.is_busy_xy()
                 traverse_live = (
@@ -644,7 +742,7 @@ def build_controller(
     port: str,
     baudrate: int = 115200,
     axes: Iterable[str] = ("x", "y"),
-    max_xy_offset_um: float = 2000.0,
+    max_xy_offset_um: float = 1000.0,
     speed_mm_s: float | None = None,
     ramp_ms: float | None = None,
     backlash_mm: float | None = None,
@@ -654,16 +752,16 @@ def build_controller(
     counts_per_um: float = TENTHS_PER_UM,
     z_counts_per_um: float = TENTHS_PER_UM,
     max_z_offset_um: float | None = None,
+    wheel: int | None = None,
 ) -> AsiStageController:
     """Open a sole-owned ASI session with explicit bounds and optional profile."""
     if not port:
         raise ValueError("serial port is required")
-    if (
-        isinstance(max_xy_offset_um, bool)
-        or not math.isfinite(max_xy_offset_um)
-        or not 0 < max_xy_offset_um <= 2000.0
-    ):
-        raise ValueError("XY envelope must be positive and no greater than 2000 um")
+    for axis, limit in (("XY", max_xy_offset_um), ("Z", max_z_offset_um)):
+        if axis == "Z" and limit is None:
+            continue
+        if type(limit) not in (int, float) or not 0 < limit <= 1000.0:
+            raise ValueError(f"{axis} travel envelope must be in (0, 1000] um")
     if (
         isinstance(absolute_takeup_um, bool)
         or not isinstance(absolute_takeup_um, (int, float))
@@ -700,7 +798,7 @@ def build_controller(
         # The configured run speed is the ceiling unless the caller explicitly
         # starts the service faster; a remote profile write may not raise it.
         maximum_speed = 1.0 if speed_mm_s is None else min(1.0, speed_mm_s)
-        return AsiStageController(
+        controller = AsiStageController(
             stage,
             client,
             axes,
@@ -710,6 +808,9 @@ def build_controller(
             z_counts_per_um=z_counts_per_um,
             max_z_offset_um=max_z_offset_um,
         )
+        if wheel is not None:
+            controller.add_sub_controller("Wheel", AsiWheelController(LX4000FilterWheel(session, wheel=wheel)))
+        return controller
     except BaseException:
         client.close()
         raise
@@ -725,9 +826,10 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--counts-per-um", type=float, default=TENTHS_PER_UM)
     parser.add_argument("--axes", default="x,y")
+    parser.add_argument("--wheel", type=int, choices=(0, 1))
     parser.add_argument("--z-counts-per-um", type=float, default=TENTHS_PER_UM)
     parser.add_argument("--max-z-offset-um", type=float)
-    parser.add_argument("--max-xy-offset-um", type=float, default=2000.0)
+    parser.add_argument("--max-xy-offset-um", type=float, default=1000.0)
     parser.add_argument(
         "--speed-mm-s",
         type=float,
@@ -758,6 +860,10 @@ def main(argv: list[str] | None = None) -> int:
     )
     identity_arguments(parser, "asi-serial-stage")
     options = parser.parse_args(argv)
+    for axis in ("xy", "z"):
+        limit = getattr(options, f"max_{axis}_offset_um")
+        if limit is not None and not 0 < limit <= 1000.0:
+            parser.error(f"--max-{axis}-offset-um must be in (0, 1000]")
     configure_logging()
     axes = [axis.strip() for axis in options.axes.split(",") if axis.strip()]
     controller = build_controller(
@@ -774,6 +880,7 @@ def main(argv: list[str] | None = None) -> int:
         counts_per_um=options.counts_per_um,
         z_counts_per_um=options.z_counts_per_um,
         max_z_offset_um=options.max_z_offset_um,
+        wheel=options.wheel,
     )
     return run(serve(controller, controller_id(options)))
 

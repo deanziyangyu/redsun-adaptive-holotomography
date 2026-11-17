@@ -8,7 +8,7 @@ from pathlib import Path
 
 from fastcs.attributes import AttrR, AttrRW, AttrW, AttributeIO, AttributeIORef
 from fastcs.controllers import Controller
-from fastcs.datatypes import Bool, String
+from fastcs.datatypes import Bool, Int, String
 from redsun.services import configure_logging
 
 from ._process import controller_id, identity_arguments, run, serve
@@ -19,34 +19,44 @@ class LightRef(AttributeIORef):
     field: str = ""
 
 
-class LightIO(AttributeIO):
+class LightIO(AttributeIO[bool | int | str, LightRef]):
     def __init__(self, light):
         super().__init__()
         self.light = light
+        self._lock = asyncio.Lock()
 
     async def update(self, attr: AttrR):
-        await attr.update(await self.light.call(self.light.read, attr.io_ref.field))
+        async with self._lock:
+            await attr.update(await self.light.call(self.light.read, attr.io_ref.field))
 
     async def send(self, attr: AttrW, value):
-        actual = await self.light.call(self.light.write, attr.io_ref.field, value)
-        if isinstance(attr, AttrR):
-            await attr.update(actual)
+        field = attr.io_ref.field
+        async with self._lock:
+            actual = await self.light.call(self.light.write, field, value)
+            if field == "channel":
+                # A successful channel write verifies that the shutter is closed.
+                await self.light.shutter_open.update(False)
+                await self.light.intensity.update(await self.light.call(self.light.read, "intensity"))
+            if isinstance(attr, AttrR):
+                await attr.update(actual)
 
 
 class LumencorController(Controller):
-    def __init__(self, core_factory, config, device, shutter, group, presets):
+    def __init__(self, core_factory, config, device, shutter, group, presets, *, brightfield_is_off=False):
         self.core_factory = core_factory
         self.config = config
         self.device = device
         self.shutter = shutter
         self.group = group
         self.presets = presets
+        self.brightfield_is_off = brightfield_is_off
         self.core = None
         self.closing = False
         self.executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="lumencor-mmcore")
         io = LightIO(self)
         super().__init__(ios=[io])
         self.shutter_open = AttrRW(Bool(), io_ref=LightRef(field="shutter", update_period=0.5))
+        self.intensity = AttrRW(Int(), io_ref=LightRef(field="intensity", update_period=0.5))
         self.channel = AttrRW(String(), io_ref=LightRef(field="channel", update_period=0.5))
 
     async def call(self, operation, *args):
@@ -73,10 +83,32 @@ class LumencorController(Controller):
             raise RuntimeError("Lumencor shutter readback disagrees with command")
         return actual
 
+    def _intensity_property(self):
+        color = self.read("channel").partition("_")[2]
+        if color not in {"blue", "cyan", "green", "red", "teal", "violet"}:
+            return None
+        return f"{color.title()}_Level"
+
+    def _intensity_limits(self, prop):
+        return (
+            self.core.getPropertyLowerLimit(self.device, prop),
+            self.core.getPropertyUpperLimit(self.device, prop),
+        )
+
     def read(self, field):
+        if field == "intensity":
+            prop = self._intensity_property()
+            if prop is None:
+                return 0
+            low, high = self._intensity_limits(prop)
+            level = float(self.core.getProperty(self.device, prop))
+            return round(100 * (level - low) / (high - low))
         if field == "shutter":
             return bool(self.core.getShutterOpen(self.shutter))
-        return str(self.core.getCurrentConfig(self.group))
+        current = str(self.core.getCurrentConfig(self.group))
+        if current == "brightfield" and self.brightfield_is_off:
+            return "off"
+        return current
 
     def write(self, field, value):
         if self.closing:
@@ -84,13 +116,26 @@ class LumencorController(Controller):
         if field == "shutter":
             if not value:
                 return self._set_shutter(False)
-            if self.read("channel") not in self.presets:
-                raise RuntimeError("Select an allowed Lumencor channel before opening")
+            channel = self.read("channel")
+            if channel == "off" or channel not in self.presets:
+                raise RuntimeError("Select an illumination preset before opening the Lumencor shutter")
             try:
                 return self._set_shutter(True)
             except Exception:
                 self._set_shutter(False)
                 raise
+        if field == "intensity":
+            if type(value) is not int or not 0 <= value <= 100:
+                raise ValueError("Spectra intensity must be an integer from 0 to 100 percent")
+            prop = self._intensity_property()
+            if prop is None:
+                raise RuntimeError("Select a Spectra channel before setting intensity")
+            low, high = self._intensity_limits(prop)
+            level = round(low + (high - low) * value / 100)
+            self.core.setProperty(self.device, prop, str(level))
+            if float(self.core.getProperty(self.device, prop)) != level:
+                raise RuntimeError("Spectra intensity readback disagrees with command")
+            return round(100 * (level - low) / (high - low))
         if value not in self.presets:
             raise ValueError("Unknown Lumencor channel preset")
         self._set_shutter(False)
@@ -99,9 +144,10 @@ class LumencorController(Controller):
             self.core.waitForConfig(self.group, value)
         finally:
             self._set_shutter(False)
-        if self.read("channel") != value:
+        expected = "off" if value == "brightfield" and self.brightfield_is_off else value
+        if self.read("channel") != expected:
             raise RuntimeError("Lumencor channel readback disagrees with command")
-        return value
+        return expected
 
     def _close(self):
         if self.core is None:
@@ -116,6 +162,9 @@ class LumencorController(Controller):
     async def connect(self):
         try:
             await self.call(self._load)
+            await self.shutter_open.update(await self.call(self.read, "shutter"))
+            await self.channel.update(await self.call(self.read, "channel"))
+            await self.intensity.update(await self.call(self.read, "intensity"))
             await super().connect()
         except BaseException:
             await self.disconnect()
@@ -142,9 +191,12 @@ def main(argv=None):
     parser.add_argument("--shutter-device", required=True)
     parser.add_argument("--channel-group", required=True)
     parser.add_argument("--allowed-presets", required=True, help="Comma-separated MMCore preset names")
+    parser.add_argument("--brightfield-is-off", action="store_true")
     identity_arguments(parser, "lumencor-spectra")
     options = parser.parse_args(argv)
     presets = {value.strip() for value in options.allowed_presets.split(",") if value.strip()}
+    if options.brightfield_is_off and not {"off", "brightfield"} <= presets:
+        parser.error("--brightfield-is-off requires both presets")
     if not options.mmcore_config.is_file() or not presets or any(
         "REPLACE_" in value for value in (
             str(options.mmcore_config), options.mm_path or "", options.device_label,
@@ -161,6 +213,7 @@ def main(argv=None):
     controller = LumencorController(
         make_core, options.mmcore_config, options.device_label,
         options.shutter_device, options.channel_group, presets,
+        brightfield_is_off=options.brightfield_is_off,
     )
     async def run_service():
         try:

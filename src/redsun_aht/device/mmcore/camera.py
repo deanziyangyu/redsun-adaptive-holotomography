@@ -47,6 +47,8 @@ from ophyd_async.core import (
     StreamResourceDataProvider,
     StreamResourceInfo,
     TriggerInfo,
+    callback_on_mock_put,
+    set_mock_value,
     wait_for_value,
 )
 from ophyd_async.fastcs.core import fastcs_connector
@@ -389,6 +391,27 @@ class MMCamera(StandardDetector, Loggable):
             self._acquire,
             ServiceDataLogic(self, path_provider),
         )
+
+    async def connect(self, *args, **kwargs) -> None:
+        await super().connect(*args, **kwargs)
+        if not kwargs.get("mock", args[0] if args else False):
+            return
+
+        shape = (4, 4)
+        dtype = np.dtype("uint16")
+        set_mock_value(self.sensor_size, np.asarray(shape[::-1], dtype=np.int32))
+        set_mock_value(self.pixel_dtype, dtype.name)
+        set_mock_value(self.pixel_dtypes, dtype.name)
+        set_mock_value(self.roi, Roi(0, 0, shape[1], shape[0]).as_text())
+        set_mock_value(self.buffer, np.zeros(shape, dtype=dtype))
+
+        async def snap(requested: bool) -> None:
+            if requested:
+                count = await self.frame_count.get_value() + 1
+                set_mock_value(self.buffer, np.full(shape, count % 65536, dtype=dtype))
+                set_mock_value(self.frame_count, count)
+
+        callback_on_mock_put(self.snap_request, snap)
 
     def dpct_store_uri(self, run_id: str) -> str:
         """Reserve a separate local pixel store for one software DPCT run."""

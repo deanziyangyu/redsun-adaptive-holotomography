@@ -16,6 +16,8 @@ import numpy as np
 
 from redsun_aht.device.automatic_shot_capture import CameraFrame
 
+DCAM_STACK_MAX_BYTES = 128 * 1024 * 1024
+
 if TYPE_CHECKING:
     from collections.abc import Callable
 
@@ -35,6 +37,8 @@ class UniMMCoreTriggeredCamera:
         poll_interval_s: float = 0.001,
         continuous: bool = False,
         required_properties: dict[str, str] | None = None,
+        owns_core: bool = False,
+        max_frame_bytes: int | None = None,
     ) -> None:
         if not all(
             isinstance(x, str) and x for x in (device, trigger_property, trigger_value)
@@ -52,6 +56,11 @@ class UniMMCoreTriggeredCamera:
         ):
             raise ValueError("required camera properties must be nonempty strings")
         self.continuous = continuous
+        self.owns_core = owns_core
+        if max_frame_bytes is not None and (type(max_frame_bytes) is not int or max_frame_bytes <= 0):
+            raise ValueError("Frame byte limit must be a positive integer")
+        self._max_frame_bytes = max_frame_bytes
+        self._frame_bytes = 0
         self.required_properties = dict(required_properties or {})
         self.core, self.device = core, device
         self.trigger_property, self.trigger_value = trigger_property, trigger_value
@@ -65,6 +74,7 @@ class UniMMCoreTriggeredCamera:
         )
         self._used = False
         self._closed = False
+        self._cleanup = None
         self._started = False
         self._frames: list[CameraFrame] = []
 
@@ -73,7 +83,7 @@ class UniMMCoreTriggeredCamera:
             self._worker, func, *args
         )
 
-    def _arm_sync(self, count: int) -> None:
+    def _check_trigger_configuration(self) -> None:
         if self.core.getCameraDevice() != self.device:
             raise RuntimeError("unexpected camera device")
         if (
@@ -84,8 +94,19 @@ class UniMMCoreTriggeredCamera:
         for prop, expected in self.required_properties.items():
             if self.core.getProperty(self.device, prop) != expected:
                 raise RuntimeError(f"camera property mismatch: {prop}")
+
+    def _arm_sync(self, count: int) -> None:
+        self._check_trigger_configuration()
         if self.core.isSequenceRunning():
             raise RuntimeError("camera sequence already running")
+        if self._max_frame_bytes is not None:
+            width = int(self.core.getImageWidth())
+            height = int(self.core.getImageHeight())
+            bytes_per_pixel = int(self.core.getBytesPerPixel())
+            if min(width, height, bytes_per_pixel) <= 0:
+                raise RuntimeError("Invalid triggered camera frame layout")
+            if width * height * bytes_per_pixel * count > self._max_frame_bytes:
+                raise RuntimeError("Requested stack exceeds the triggered camera frame budget")
         self.core.clearCircularBuffer()
         # Mark attempted first: an exception may occur after the camera started.
         self._started = True
@@ -113,7 +134,11 @@ class UniMMCoreTriggeredCamera:
             sequence = self.counter_from_metadata(metadata)
             if type(sequence) is not int or sequence < 0:
                 raise ValueError("invalid camera metadata counter")
-            pixels = np.asarray(image).copy()
+            view = np.asarray(image)
+            if self._max_frame_bytes is not None and self._frame_bytes + view.nbytes > self._max_frame_bytes:
+                raise RuntimeError("Triggered camera frame budget exceeded")
+            pixels = view.copy()
+            self._frame_bytes += pixels.nbytes
             pixels.setflags(write=False)
             return CameraFrame(sequence, received, pixels), True
         return None, bool(self.core.isSequenceRunning())
@@ -122,6 +147,12 @@ class UniMMCoreTriggeredCamera:
     def partial_frames(self) -> tuple[CameraFrame, ...]:
         """Frames copied so far; an in-flight pop may not yet be present."""
         return tuple(self._frames)
+
+    def take_frames(self) -> list[CameraFrame]:
+        """Transfer ownership of the collected frames to a one-shot consumer."""
+        frames = self._frames
+        self._frames = []
+        return frames
 
     async def collect(self, frame_count: int) -> tuple[CameraFrame, ...]:
         """Drain copied frames and independently supplied metadata counters."""
@@ -140,6 +171,7 @@ class UniMMCoreTriggeredCamera:
         return tuple(self._frames)
 
     def _ready_sync(self) -> None:
+        self._check_trigger_configuration()
         if not self.core.isSequenceRunning():
             raise RuntimeError("camera sequence is not running")
         if self.core.isBufferOverflowed() or self.core.getRemainingImageCount():
@@ -153,10 +185,14 @@ class UniMMCoreTriggeredCamera:
         if self._frames:
             raise RuntimeError("unexpected camera frames before stack start")
 
-    def _finish_sync(self) -> None:
+    def _stop_sequence_sync(self) -> None:
         if self._started:
-            self.core.stopSequenceAcquisition()
+            if self.continuous or self.core.isSequenceRunning():
+                self.core.stopSequenceAcquisition()
             self._started = False
+
+    def _finish_sync(self) -> None:
+        self._stop_sequence_sync()
         if self.core.isBufferOverflowed():
             raise RuntimeError("camera circular buffer overflow")
         if self.core.getRemainingImageCount():
@@ -167,16 +203,60 @@ class UniMMCoreTriggeredCamera:
         await self._call(self._finish_sync)
 
     def _close_sync(self) -> None:
-        if self._started:
-            self.core.stopSequenceAcquisition()
-            self._started = False
+        try:
+            self._stop_sequence_sync()
+        finally:
+            if self.owns_core:
+                self.core.unloadAllDevices()
 
     async def close(self) -> None:
         """Request camera sequence stop and close the serialized worker."""
-        if self._closed:
-            return
-        self._closed = True
-        try:
-            await self._call(self._close_sync)
-        finally:
+        if self._cleanup is None:
+            self._closed = True
+            self._cleanup = self._worker.submit(self._close_sync)
             self._worker.shutdown(wait=False)
+        completion = asyncio.wrap_future(self._cleanup)
+        # A timed-out caller must not cancel queued native cleanup.
+        completion.add_done_callback(lambda future: future.exception() if not future.cancelled() else None)
+        await asyncio.shield(completion)
+
+    @property
+    def released(self) -> bool:
+        """Whether camera cleanup returned successfully."""
+        cleanup = self._cleanup
+        return cleanup is not None and cleanup.done() and not cleanup.cancelled() and cleanup.exception() is None
+
+
+def dcam_image_number(metadata: Any) -> int:
+    """Extract DCAM's adapter counter, without falling back to a core index."""
+    try:
+        raw = metadata.GetSingleTag("HamamatsuImageNr").GetValue()
+    except (AttributeError, KeyError, RuntimeError) as error:
+        raise ValueError("Missing HamamatsuImageNr metadata") from error
+    if not isinstance(raw, str) or not raw.isascii() or not raw.isdecimal():
+        raise ValueError(f"Invalid HamamatsuImageNr: {raw!r}")
+    # The adapter reports zero for its first frame after arming.
+    return int(raw) + 1
+
+
+def dcam_external_stack_camera(
+    core: Any, *, device: str, polarity: str, owns_core: bool = False,
+) -> UniMMCoreTriggeredCamera:
+    """Bind an exclusively owned DCAM core to the finite Due stack contract."""
+    if polarity not in ("NEGATIVE", "POSITIVE"):
+        raise ValueError("Supply the commissioned DCAM trigger polarity")
+    return UniMMCoreTriggeredCamera(
+        core,
+        device=device,
+        trigger_property="TRIGGER SOURCE",
+        trigger_value="EXTERNAL",
+        counter_baseline=0,
+        counter_from_metadata=dcam_image_number,
+        owns_core=owns_core,
+        max_frame_bytes=DCAM_STACK_MAX_BYTES,
+        required_properties={
+            "TRIGGER ACTIVE": "EDGE",
+            "TriggerPolarity": polarity,
+            "Trigger": "NORMAL",
+        },
+    )
