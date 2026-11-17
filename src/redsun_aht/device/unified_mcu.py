@@ -9,10 +9,13 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+import secrets
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, cast
 
 from oxiserial.aio import serial_for_url
+
+from redsun_aht.device.dynamic_patterns import DynamicPattern, DynamicPatternLink
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable, Sequence
@@ -20,6 +23,7 @@ if TYPE_CHECKING:
     from redsun_aht.device.arduino.service import AsyncSerialPort
 
 IDENTITY = "ARH-UNIFIED-STACK/0.18"
+DUE_IDENTITY = "ARH-DUE ZDT-X protocol=1"
 logger = logging.getLogger(__name__)
 
 
@@ -185,6 +189,7 @@ class UnifiedMcu:
             raise ValueError("line timeout must be positive")
         self._port = port
         self._line_timeout_s = line_timeout_s
+        self._dynamic = DynamicPatternLink(self._write, self._line, self._dynamic_cleanup, line_timeout_s)
         self._operation = asyncio.Lock()
         self._write_lock = asyncio.Lock()
         self._identified = False
@@ -233,6 +238,87 @@ class UnifiedMcu:
         response = await self._line()
         if response != expected:
             raise UnifiedMcuError(f"unexpected response to {command}: {response!r}")
+
+    async def _dynamic_cleanup(self, command: str) -> None:
+        self._uncertain = True
+        try:
+            await asyncio.shield(asyncio.wait_for(self._write(command), 1.0))
+        except BaseException:
+            logger.exception("Could not send dynamic cleanup command")
+
+    async def upload_dynamic_pattern(self, slot: int, pixels: bytes) -> DynamicPattern:
+        """Publish one dynamic slot under the serial operation lock."""
+        self._admit()
+        async with self._operation:
+            return await self._dynamic.upload_dynamic_pattern(slot, pixels)
+
+    async def dynamic_shots(
+        self,
+        patterns: Sequence[DynamicPattern],
+        repeats: int,
+        snap: Callable[[int, DynamicPattern], Awaitable[None]],
+        *,
+        camera_exclusive: bool,
+        illumination_ready: bool,
+        snap_timeout_s: float = 20.0,
+    ) -> None:
+        """Run a stationary recipe, counting frames only after snap returns."""
+        patterns = tuple(patterns)
+        if not 1 <= len(patterns) <= 64 or type(repeats) is not int or not 1 <= repeats <= 32:
+            raise ValueError("expected 1..64 steps and 1..32 repeats")
+        if camera_exclusive is not True or illumination_ready is not True:
+            raise ValueError("exclusive camera and illumination readiness required")
+        if not 0 < snap_timeout_s < 30:
+            raise ValueError("snap timeout must be positive and below the firmware lease")
+        self._admit()
+        async with self._operation:
+            await self._dynamic.capabilities()
+            for pattern in dict.fromkeys(patterns):
+                if (
+                    type(pattern.slot) is not int or not 1 <= pattern.slot <= 5
+                    or type(pattern.generation) is not int or not 1 <= pattern.generation <= 0xFFFFFFFF
+                    or type(pattern.crc32) is not int or not 0 <= pattern.crc32 <= 0xFFFFFFFF
+                ):
+                    raise ValueError("invalid dynamic pattern receipt")
+                await self._exchange(
+                    f"DPSLOT? {pattern.slot}",
+                    f"DPSLOT {pattern.slot} {pattern.generation} {pattern.crc32}",
+                )
+            run = 1 + secrets.randbelow(0xFFFFFFFF)
+            replay: set[str] = set()
+            total = len(patterns) * repeats
+            try:
+                await self._dynamic.exchange(
+                    f"DPCFG {run} {len(patterns)} {repeats}", f"DPCFG {run}", replay
+                )
+                for index, pattern in enumerate(patterns):
+                    await self._dynamic.exchange(
+                        f"DPSTEP {run} {index} {pattern.slot} {pattern.generation}",
+                        f"DPSTEP {run} {index}", replay,
+                    )
+                await self._dynamic.exchange(f"DPARM {run}", f"DPARM {run} {total}", replay)
+                for ordinal in range(total):
+                    pattern = patterns[ordinal % len(patterns)]
+                    token = ordinal + 1
+                    await self._dynamic.exchange(
+                        f"DPNEXT {run} {ordinal}",
+                        f"DPREADY {run} {ordinal} {pattern.slot} {pattern.generation} {token}",
+                        replay,
+                    )
+                    await asyncio.wait_for(snap(ordinal, pattern), snap_timeout_s)
+                    await self._dynamic.exchange(
+                        f"DPACK {run} {ordinal} {token}", f"DPACK {run} {ordinal} {token}", replay
+                    )
+                await self._dynamic.exchange(
+                    f"DPSTATUS? {run}", f"DPSTATUS {run} 4 {total} 0", replay
+                )
+                await self._dynamic.exchange(
+                    f"DPSTOP {run}", f"DPSTOP {run}", replay, retries=0
+                )
+                self._illumination_held = False
+            except BaseException:
+                await self._dynamic_cleanup(f"DPSTOP {run}")
+                raise
 
     async def _preflight(
         self, command: str, prefix: str, function: int, fields: int
@@ -333,15 +419,15 @@ class UnifiedMcu:
                 self._uncertain = True
                 raise
 
-    async def identify(self) -> None:
-        """Require the current firmware protocol before any operation."""
+    async def identify(self, *, due: bool = False) -> None:
+        """Require the selected firmware identity before any operation."""
         if self._operation.locked() or self._uncertain:
             raise UnifiedMcuError("unified MCU busy or uncertain")
         async with self._operation:
             try:
-                await self._write("identity")
+                await self._write("ID?" if due else "identity")
                 identity = await self._line()
-                if identity != IDENTITY:
+                if identity != (DUE_IDENTITY if due else IDENTITY):
                     raise UnifiedMcuError(f"unexpected firmware identity: {identity!r}")
                 self._identified = True
             except BaseException:
