@@ -253,3 +253,25 @@ class DetectorPreviewSource:
         """Return the newest frame of the detector, or ``None`` before one."""
         latest = self._preview.latest(self._detector)
         return None if latest is None else latest.snapshot()
+
+
+def wire_led_patterns(presenter, view):
+    """Initialize the plot and connect the file/selection actions."""
+    selected = None
+    errors = []
+    for filename in presenter.sources:
+        try:
+            selected = presenter.read(filename)
+        except (OSError, ValueError) as error:
+            errors.append(f"{filename}: {error}")
+    names, panel, label, weights = (presenter.contents(selected) if selected is not None
+                                    else presenter.contents())
+    view.set_patterns(names, label)
+    view.set_pattern(panel, label, weights)
+    if errors:
+        view.show_error("\n".join(errors))
+    yield view.sig_load, presenter.load
+    yield view.sig_select, presenter.select
+    yield presenter.sig_patterns, view.set_patterns
+    yield presenter.sig_pattern, view.set_pattern
+    yield presenter.sig_error, view.show_error

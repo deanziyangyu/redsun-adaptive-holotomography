@@ -34,8 +34,12 @@ class _State(ctypes.Structure):
 
 BUTTON_A = 0x1000
 BUTTON_B = 0x2000
+LEFT_SHOULDER = 0x0100
+RIGHT_SHOULDER = 0x0200
 DPAD_UP = 0x0001
 DPAD_DOWN = 0x0002
+DPAD_LEFT = 0x0004
+DPAD_RIGHT = 0x0008
 
 
 @dataclass(frozen=True, slots=True)
@@ -45,6 +49,10 @@ class ControllerState:
     buttons: int
     left_x: int
     left_y: int
+    right_x: int = 0
+    right_y: int = 0
+    left_trigger: int = 0
+    right_trigger: int = 0
 
     def __post_init__(self) -> None:
         """Reject malformed states before they can become motion intent."""
@@ -52,9 +60,11 @@ class ControllerState:
             raise ValueError("buttons must be a 16-bit mask")
         if any(
             type(v) is not int or not -32768 <= v <= 32767
-            for v in (self.left_x, self.left_y)
+            for v in (self.left_x, self.left_y, self.right_x, self.right_y)
         ):
             raise ValueError("sticks must be signed 16-bit integers")
+        if any(type(v) is not int or not 0 <= v <= 255 for v in (self.left_trigger, self.right_trigger)):
+            raise ValueError("triggers must be 8-bit integers")
 
 
 @dataclass(frozen=True, slots=True)
@@ -128,7 +138,9 @@ class XInputPoller:
         if self._get_state(self.index, ctypes.byref(state)) != 0:
             return None
         pad = state.gamepad
-        return ControllerState(int(pad.buttons), int(pad.left_x), int(pad.left_y))
+        return ControllerState(int(pad.buttons), int(pad.left_x), int(pad.left_y),
+                               int(pad.right_x), int(pad.right_y),
+                               int(pad.left_trigger), int(pad.right_trigger))
 
 
 class SurveyController:

@@ -242,6 +242,7 @@ class DetectorPresenter(DocumentRouter, Loggable):
         self._rois: dict[str, Roi] = {}
         self._roi_callbacks: dict[str, Callable[[dict[str, Reading[Any]]], None]] = {}
         self._deferrals: Deferrals | None = None
+        self._locked_detectors: frozenset[str] = frozenset()
         self.actions = ActionManager()
         run_coro(self._subscribe_rois())
 
@@ -422,11 +423,15 @@ class DetectorPresenter(DocumentRouter, Loggable):
             while True:
                 # preparing starts the live view and hands each detector the
                 # store its next capture writes; the capture declares it
-                yield from bps.stage_all(*selected)
-                yield from prepare_live_stream(
-                    selected, trigger_info, LIVE_STREAM, declare=False
-                )
-                action = yield from self.actions.wait(stream)
+                try:
+                    yield from bps.stage_all(*selected)
+                    yield from prepare_live_stream(
+                        selected, trigger_info, LIVE_STREAM, declare=False
+                    )
+                    action = yield from self.actions.wait(stream)
+                except BaseException:
+                    yield from bps.unstage_all(*selected)
+                    raise
                 try:
                     names = ", ".join(detector.name for detector in selected)
                     self.logger.info(f"live_stream: writing {names} to disk")
@@ -507,6 +512,8 @@ class DetectorPresenter(DocumentRouter, Loggable):
         detector, key, signal = resolved
 
         async def apply() -> None:
+            if detector in self._locked_detectors:
+                return
             try:
                 await signal.set(value)
             except Exception as error:  # the view is told, the loop goes on
@@ -524,6 +531,10 @@ class DetectorPresenter(DocumentRouter, Loggable):
             self._deferrals.request(apply)
             return
         await apply()
+
+    def set_locked(self, names: frozenset[str]) -> None:
+        """Keep desktop setting edits from reaching detectors held by a plan."""
+        self._locked_detectors = names
 
     @slot
     async def set_property(self, detector: str, property: str, value: Any) -> None:

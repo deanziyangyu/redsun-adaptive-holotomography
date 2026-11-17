@@ -553,6 +553,22 @@ def test_stop_and_restart_leave_no_stale_subscriptions() -> None:
         presenter.shutdown()
 
 
+def test_stop_preview_before_recording_releases_detector() -> None:
+    flyer = FakeFlyer("cam")
+    presenter = DetectorPresenter("det", detectors={"cam": flyer})
+    engine = RunEngine({})
+    try:
+        future = _start(engine, presenter, [flyer], 3, False)
+        _stop(engine, future)
+        assert flyer.unstage_calls == 1
+        assert not flyer.staged
+        assert flyer.kickoff_calls == 0
+        asyncio.run(presenter.set("cam-exposure", 5.0))
+        assert asyncio.run(flyer.exposure.get_value()) == 5.0
+    finally:
+        presenter.shutdown()
+
+
 def test_a_finite_capture_uses_the_frame_count_as_trigger_info() -> None:
     """Ask the detectors to write exactly the requested number of frames."""
     flyer = FakeFlyer("cam", frames=1)

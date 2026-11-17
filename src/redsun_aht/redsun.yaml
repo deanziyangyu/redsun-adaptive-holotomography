@@ -9,6 +9,8 @@
 # way when a profile declares the component instead of a session class.
 
 devices:
+  workcell-webcam: redsun_aht.robotic.device.workcell_webcam:WorkcellWebcam
+  asi-filter-wheel: redsun_aht.robotic.device.asi._service:AsiFilterWheel
   asi-lx4000: redsun_aht.robotic.device.asi._service:AsiSerialStage
   lumencor-spectra: redsun_aht.robotic.device.auxiliary:LumencorSpectra
   unified-emmsh: redsun_aht.robotic.device.auxiliary:UnifiedEmmsh
@@ -30,9 +32,15 @@ views:
   image: redsun_aht.view.image:ImageView
 
 services:
+  workcell-webcam:
+    module: redsun_aht.robotic.services.workcell_webcam
+    ready: workcell webcam ready
   mmcore-camera:
     module: redsun_aht.services.mmcore_camera
     ready: mmcore camera ready
+  opencv-camera:
+    module: redsun_aht.services.opencv_camera
+    ready: opencv camera ready
   spinnaker-camera:
     module: redsun_aht.services.spinnaker_camera
     ready: spinnaker camera ready

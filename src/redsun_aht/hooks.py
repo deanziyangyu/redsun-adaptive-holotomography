@@ -21,6 +21,7 @@ Changed for :mod:`redsun_aht`:
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import TYPE_CHECKING, Any, cast
 
 if TYPE_CHECKING:
@@ -44,6 +45,7 @@ class NapariApplication:
     def __init__(self) -> None:
         self._viewer: ViewerModel | None = None
         self._qt_viewer: Any | None = None
+        self._remove_viewer_provider: Callable[[], None] | None = None
 
     def create_application(self, argv: list[str]) -> QApplication:
         """Return napari's application and make the session's viewer.
@@ -60,6 +62,7 @@ class NapariApplication:
         QApplication
             The running application, created by napari when none exists.
         """
+        from napari._app_model import get_app_model
         from napari._qt.qt_event_loop import get_qapp
         from napari._qt.qt_viewer import QtViewer
         from napari.components import ViewerModel
@@ -69,7 +72,14 @@ class NapariApplication:
             self._viewer = ViewerModel(
                 title="aht-viewer", ndisplay=2, order=(), axis_labels=()
             )
-            self._qt_viewer = QtViewer(self._viewer, show_welcome_screen=False)
+            store = get_app_model().injection_store
+            provider = store.register_provider(lambda: self._viewer, ViewerModel)
+            self._remove_viewer_provider = provider.cleanup
+            try:
+                self._qt_viewer = QtViewer(self._viewer, show_welcome_screen=False)
+            except BaseException:
+                self.close()
+                raise
         global _APPLICATION
         _APPLICATION = self
         return application
@@ -107,12 +117,21 @@ class NapariApplication:
         qt_viewer = self._qt_viewer
         self._viewer = None
         self._qt_viewer = None
-        if viewer is not None:
-            viewer.layers.clear()
-        if qt_viewer is not None:
-            qt_viewer.close()
-        if _APPLICATION is self:
-            _APPLICATION = None
+        try:
+            if self._remove_viewer_provider is not None:
+                self._remove_viewer_provider()
+                self._remove_viewer_provider = None
+            if viewer is not None:
+                viewer.layers.clear()
+            if qt_viewer is not None:
+                qt_viewer.close()
+        except RuntimeError as error:
+            # On a failed build the Qt parent can destroy the embedded viewer first.
+            if str(error) != "wrapped C/C++ object of type QtViewer has been deleted":
+                raise
+        finally:
+            if _APPLICATION is self:
+                _APPLICATION = None
 
     def shutdown(self) -> None:
         """Close the viewer when the session releases its hooks."""

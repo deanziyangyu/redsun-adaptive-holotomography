@@ -352,10 +352,12 @@ class DetectorLayers:
                 key, self._controller_factory(self._viewer, self._names[key])
             )
             if self._names[key] not in self._viewer.layers:
-                self._viewer.add_image(
+                layer = self._viewer.add_image(
                     np.zeros(spec.shape, dtype=np.dtype(spec.dtype)),
                     name=self._names[key],
                 )
+                if np.dtype(spec.dtype) == np.dtype("uint16"):
+                    cast("Any", layer).auto_contrast = True
 
     def refresh(self, detector: str, frame: PreviewImage) -> bool:
         """Draw *frame* on *detector*'s layer and return whether it changed.
@@ -536,6 +538,7 @@ class ImageView(QtWidgets.QWidget, Loggable):
             self._owns_viewer = True
         self._layers = DetectorLayers(self._viewer)
         self._drivers: dict[str, PreviewDriver] = {}
+        self._standalone_previews: dict[str, PreviewLayerController] = {}
         self._roi_layers: dict[str, Any] = {}
         self._build_layout()
         self.logger.info("Initialized")
@@ -555,6 +558,7 @@ class ImageView(QtWidgets.QWidget, Loggable):
         source: PreviewSource,
         *,
         interval_ms: int = 200,
+        standalone: bool = False,
     ) -> None:
         """Refresh *detector*'s layer from *source* on a timer.
 
@@ -568,8 +572,15 @@ class ImageView(QtWidgets.QWidget, Loggable):
             :class:`~redsun_aht.view.preview.LatestPreview` qualifies.
         interval_ms : int
             Refresh interval in milliseconds.
+        standalone : bool
+            Create the layer from its first frame when there is no detector.
         """
         controller = self._layers.controller(detector)
+        if controller is None and standalone:
+            controller = self._standalone_previews.get(detector)
+            if controller is None:
+                controller = PreviewLayerController(self._viewer, name=detector)
+                self._standalone_previews[detector] = controller
         if controller is None:
             self.logger.warning(
                 f"No image layer for detector {detector!r}; not starting a preview"
@@ -600,6 +611,11 @@ class ImageView(QtWidgets.QWidget, Loggable):
             except ValueError:
                 return
 
+    def set_roi_locked(self, names: frozenset[str]) -> None:
+        """Keep the ROI overlays visible while disabling edits on held cameras."""
+        for detector, layer in self._roi_layers.items():
+            layer.editable = detector not in names
+
     @slot
     def set_roi_selection(self, detector: str, enabled: bool) -> None:
         """Show the box on *detector*'s layer and let it be edited, or hide it."""
@@ -624,6 +640,9 @@ class ImageView(QtWidgets.QWidget, Loggable):
         for driver in self._drivers.values():
             driver.stop()
         self._drivers.clear()
+        for controller in self._standalone_previews.values():
+            controller.close()
+        self._standalone_previews.clear()
         self._layers.close()
         for layer in self._roi_layers.values():
             name = getattr(layer, "name", None)

@@ -421,7 +421,7 @@ class DetectorView(QtWidgets.QWidget, Loggable):
     def on_roi_drawn(self, detector: str, roi: Roi) -> None:
         """Fill *detector*'s editor with the region dragged on its image."""
         widget = self.settings_controls.get(detector)
-        if widget is not None and widget.roi_panel is not None:
+        if widget is not None and widget.roi_panel is not None and widget.roi_panel.isEnabled():
             widget.roi_panel.draw(roi)
 
     @slot

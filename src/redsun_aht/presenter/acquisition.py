@@ -61,6 +61,8 @@ from redsun_aht.presenter.detector import (
     DetectorPresenter,
 )
 from redsun_aht.protocols import LiveFlyer  # noqa: TC001
+from redsun_aht.presenter.arh import ArhPresenter
+from redsun_aht.robotic.device.workcell_webcam import WorkcellWebcam
 
 __all__ = [
     "CAMERA_ROLE_NOTICE",
@@ -222,6 +224,11 @@ class AcquisitionPresenter(_AcquisitionPresenter):
     _detector: DetectorPresenter | None
     """The detector presenter whose live-stream plan this one routes to."""
 
+    @property
+    def accepting_plan(self) -> bool:
+        """Whether the RunEngine can accept a new desktop request."""
+        return not self._futures and self._engine.state == "idle"
+
     def __post_init__(self) -> None:
         """Build the engine and deferrals of the base, before a detector is given."""
         super().__post_init__()
@@ -336,3 +343,33 @@ class AcquisitionPresenter(_AcquisitionPresenter):
                 "declare a DetectorPresenter in the session"
             )
         yield from detector.live_stream(detectors, frames, write_forever, stream)
+
+
+class ArhAcquisitionPresenter(AcquisitionPresenter):
+    """Add the workcell camera selector to the ARH live stream plan."""
+
+    def setup(
+        self,
+        plan_sources: Mapping[str, HasPlans],
+        callbacks: Mapping[str, CallbackType],
+        paths: SessionPathProvider,
+    ) -> None:
+        self._arh = next((source for source in plan_sources.values()
+                          if isinstance(source, ArhPresenter)), None)
+        super().setup(plan_sources, callbacks, paths)
+
+    @continuous
+    def live_stream(
+        self, detectors: Sequence[LiveFlyer] = (), frames: int = 10,
+        write_forever: bool = False, /, stream: PlanAction = STREAM,
+        webcam: Sequence[WorkcellWebcam] = (),
+    ) -> MsgGenerator[None]:
+        """Preview microscope detectors or a single workcell webcam."""
+        if webcam:
+            if detectors or len(webcam) != 1:
+                raise ValueError("Select the workcell webcam on its own for live preview")
+            if self._arh is None:
+                raise RuntimeError("The session has no workcell preview presenter")
+            yield from self._arh.workcell_preview(webcam[0], frames, continuous=write_forever)
+            return
+        yield from super().live_stream(detectors, frames, write_forever, stream)

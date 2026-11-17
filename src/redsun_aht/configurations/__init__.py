@@ -52,6 +52,20 @@ def _run_dpct(argv: Sequence[str]) -> int | None:
     run_dpct(argv)
 
 
+def _run_arh(argv: Sequence[str]) -> int | None:
+    """Run the ARH instrument desktop session."""
+    from .arh import run_arh
+
+    run_arh(argv)
+
+
+def _run_holospim(argv: Sequence[str]) -> int | None:
+    """Run the HoloSPIM instrument desktop."""
+    from .holospim import run_holospim
+
+    run_holospim(argv)
+
+
 def _run_rotation(argv: Sequence[str]) -> int | None:
     """Run the rotation motor widget."""
     from .rotation import run_rotation
@@ -122,14 +136,24 @@ def _serve_arduino_led(argv: Sequence[str]) -> int | None:
     return main(list(argv))
 
 
+def _serve_workcell_webcam(argv: Sequence[str]) -> int:
+    """Serve the OpenCV workcell recorder over PVAccess."""
+    from ..robotic.services.workcell_webcam import main
+
+    return main(list(argv))
+
+
 _SESSIONS: Mapping[str, Entry] = {
     "camera": _run_camera,
     "dpct": _run_dpct,
+    "arh": _run_arh,
+    "holospim": _run_holospim,
     "rotation": _run_rotation,
     "profile": _run_profile,
 }
 
 _SERVICES: Mapping[str, Entry] = {
+    "workcell-webcam": _serve_workcell_webcam,
     "mmcore-camera": _serve_mmcore_camera,
     "spinnaker-camera": _serve_spinnaker_camera,
     "mmcore-stage": _serve_mmcore_stage,
