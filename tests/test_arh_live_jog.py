@@ -110,3 +110,92 @@ def test_holospim_mapping_uses_horizontal_dpad_for_zdt_focus():
     for _ in range(3):
         jog.poll()
     assert [call.args for call in move.call_args_list] == [("zdt", -1), ("z", 1)]
+
+
+def test_holospim_survey_jog_ignores_unavailable_axes():
+    read = Mock(side_effect=[
+        ControllerState(0, 0, 0),
+        ControllerState(BUTTON_A | DPAD_LEFT, 0, 0, right_x=32767),
+        ControllerState(BUTTON_A, 18000, 0, right_y=32767),
+        ControllerState(BUTTON_A | DPAD_UP, 0, 0),
+        ControllerState(0, 0, 0),
+    ])
+    move, halt, halt_mcu = Mock(), Mock(), Mock()
+    jog = LiveJog(
+        read, move, halt, halt_mcu=halt_mcu, zdt_is_focus=True,
+        supported_axes={"x", "y", "z"},
+    )
+    for _ in range(5):
+        jog.poll()
+    assert [call.args for call in move.call_args_list] == [("x", 1), ("z", 1)]
+    halt.assert_called_once()
+    halt_mcu.assert_not_called()
+
+
+def test_holospim_positioner_stops_only_unsettled_jogs(monkeypatch):
+    from types import MethodType, SimpleNamespace
+
+    from redsun.utils.devices import DevicePath
+
+    from redsun_aht.configurations import holospim
+
+    monkeypatch.setattr(holospim, "XInputPoller", Mock())
+    monkeypatch.setattr(holospim, "QtCore", SimpleNamespace(QTimer=Mock()))
+    monkeypatch.setattr(holospim, "QtWidgets", SimpleNamespace(QApplication=Mock()))
+    view = Mock(spec=holospim.HolospimPositionerView)
+    for name in (
+        "configure_jog", "_move_jog", "_stop_jog", "set_moving", "set_locked",
+    ):
+        setattr(view, name, MethodType(getattr(holospim.HolospimPositionerView, name), view))
+    view._groups = {"survey": Mock()}
+    view._paths = {}
+    view._held_boxes = set()
+    view._configuration_tab = None
+    view._lock_entries = Mock()
+    view._paths["survey"] = {
+        "z": DevicePath("survey", ("axis", "z"), ("survey", "survey-axis", "survey-axis-z")),
+    }
+    view.configure_jog({"z": ("survey", "z"), "zdt": ("mcu", "x28"), "roll": ("rotation", "rotation")})
+    moves, stops = [], []
+    view.sig_move.emit.side_effect = lambda *args: moves.append(args)
+    view.sig_stop_device.emit.side_effect = stops.append
+
+    view._move_jog("z", 1)
+    view.set_moving("survey", True)
+    view._move_jog("z", 1)
+    view.set_moving("survey", False)
+    view._stop_jog()
+    assert moves == [("survey", "z", 1)]
+    assert stops == []
+
+    view._jog.jogging = True
+    view._move_jog("z", 1)
+    view.set_locked(frozenset({"survey-axis-z"}))
+    view._move_jog("z", 1)
+    assert len(moves) == 2
+    assert stops == ["survey"]
+    view.set_locked(frozenset())
+    poller = holospim.XInputPoller.return_value
+    poller.read.return_value = ControllerState(BUTTON_A | DPAD_UP, 0, 0)
+    view._jog.poll()
+    assert len(moves) == 2
+    poller.read.return_value = ControllerState(0, 0, 0)
+    view._jog.poll()
+    poller.read.return_value = ControllerState(BUTTON_A | DPAD_UP, 0, 0)
+    view._jog.poll()
+    assert len(moves) == 3
+    view.set_moving("survey", False)
+    poller.read.return_value = ControllerState(0, 0, 0)
+    view._jog.poll()
+    poller.read.return_value = ControllerState(BUTTON_A | DPAD_LEFT, 0, 0)
+    view._jog.poll()
+    assert moves[-1] == ("mcu", "x28", -1)
+    poller.read.return_value = ControllerState(0, 0, 0)
+    view._jog.poll()
+    assert stops[-1] == "mcu"
+    poller.read.return_value = ControllerState(BUTTON_A, 0, 0, right_x=32767)
+    view._jog.poll()
+    assert moves[-1] == ("rotation", "rotation", 0.2)
+    poller.read.return_value = None
+    view._jog.poll()
+    assert stops[-1] == "rotation"

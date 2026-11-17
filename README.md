@@ -10,7 +10,7 @@ Instrument profiles select the devices and services for each setup.
 
 | Selector | Packaged profile | Device stack |
 |---|---|---|
-| `holospim` | [holospim.yaml](src/redsun_aht/profiles/holospim.yaml) | MMCore camera and survey stage, plus ESP32-S3 MCU for X28 fast Z, LED and rotation |
+| `holospim` | [holospim.yaml](src/redsun_aht/profiles/holospim.yaml) | ESP300 survey XYZ, FLIR via Spinnaker, PVCAM via MMCore, plus ESP32-S3 MCU for X28 fast Z, LED and rotation |
 | `arh` | [arh_system.yaml](src/redsun_aht/profiles/arh_system.yaml) | ASI LX4000 XYZ, FLIR via Spinnaker, Lumencor Spectra via MMCore, and Arduino Due MCU |
 
 Both profiles use the same AHT installation. Keep host-specific settings in
@@ -51,12 +51,15 @@ On Windows, use the [PowerShell launcher](scripts/README.md).
 ```powershell
 pwsh -NoProfile -File scripts/run_session.ps1 -Check
 pwsh -NoProfile -File scripts/run_session.ps1 --list
-pwsh -NoProfile -File scripts/run_session.ps1 session profile arh --check
-pwsh -NoProfile -File scripts/run_session.ps1 session profile holospim --check
+pwsh -NoProfile -File scripts/run_session.ps1 session profile arh --check-profile
+pwsh -NoProfile -File scripts/run_session.ps1 session profile holospim --check-profile
 ```
 
 The profile checks build mock devices and shut down without launching services.
 Pass `--overlay <path>` to layer host settings over the packaged profile.
+Repeat a complete service entry in an overlay when changing its arguments.
+For HoloSPIM, `--check-host` validates the resulting hardware settings without
+starting the session. PowerShell's `-Check` checks the launcher environment.
 `--check` forces mock mode even if an overlay sets `mock: false`. The direct CLI
 uses a separator before profile arguments, for example
 `aht session profile -- arh --check`.

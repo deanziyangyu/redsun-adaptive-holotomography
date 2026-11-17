@@ -12,12 +12,13 @@ class LiveJog:
     """Use the existing Positioner to submit one small move at a time."""
 
     def __init__(self, read, move, halt, step_changed=None, halt_mcu=None, *,
-                 zdt_is_focus=False):
+                 zdt_is_focus=False, supported_axes=None):
         self.read = read
         self.move = move
         self.halt = halt
         self.halt_mcu = halt_mcu
         self.zdt_is_focus = zdt_is_focus
+        self.supported_axes = None if supported_axes is None else frozenset(supported_axes)
         self.rotary_jogging = False
         self.controller = SurveyController()
         self._step_index = 0
@@ -58,15 +59,18 @@ class LiveJog:
         rotary = (("roll", _stick(state.right_x, self.controller.deadzone)),
                   ("pitch", _stick(state.right_y, self.controller.deadzone)),
                   ("yaw", float(state.right_trigger > 30) - float(state.left_trigger > 30)))
-        axis, delta = max(
-            (("zdt", intent.z), ("z", focus), ("x", intent.x), ("y", intent.y), *rotary),
-            key=lambda item: abs(item[1]),
+        z_axes = (("z", intent.z), ("zdt", focus)) if self.zdt_is_focus else (
+            ("zdt", intent.z), ("z", focus),
         )
+        candidates = (*z_axes, ("x", intent.x), ("y", intent.y), *rotary)
+        if self.supported_axes is not None:
+            candidates = tuple(item for item in candidates if item[0] in self.supported_axes)
+        axis, delta = max(candidates, key=lambda item: abs(item[1]), default=("", 0.0))
         if delta:
-            if self.zdt_is_focus:
-                axis = {"z": "zdt", "zdt": "z"}.get(axis, axis)
             is_rotary = axis in ("roll", "pitch", "yaw")
-            self.jogging = self.jogging or axis in ("x", "y", "z")
+            self.jogging = self.jogging or axis in ("x", "y", "z") or (
+                self.zdt_is_focus and axis == "zdt"
+            )
             self.rotary_jogging = self.rotary_jogging or is_rotary
             step = (ROTARY_JOG_STEPS if is_rotary else JOG_STEPS)[self._step_index]
             self.move(axis, step if delta > 0 else -step)

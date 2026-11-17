@@ -81,6 +81,11 @@ class LudlSerialStageIO(AttributeIO[float, AxisRef]):
         self.busy = False
         self.outcome = "idle"
 
+    async def _move_axis(self, axis: str, value: float) -> tuple[float, float]:
+        current = await self._stage.read_xy()
+        target = (value, current[1]) if axis == "x" else (current[0], value)
+        return await self._stage.move_xy(target)
+
     async def send(self, attr: AttrW[float, AxisRef], value: float) -> None:
         """Apply a requested axis target through the serial client."""
         if attr.io_ref.axis not in ("x", "y"):
@@ -97,13 +102,7 @@ class LudlSerialStageIO(AttributeIO[float, AxisRef]):
             self.busy = True
             self.outcome = "moving"
             try:
-                current = await self._stage.read_xy()
-                target = (
-                    (float(value), current[1])
-                    if attr.io_ref.axis == "x"
-                    else (current[0], float(value))
-                )
-                actual = await self._stage.move_xy(target)
+                actual = await self._move_axis(attr.io_ref.axis, float(value))
             except BaseException:
                 # A failed wait is not evidence that the physical move stopped.
                 self.outcome = "unknown"

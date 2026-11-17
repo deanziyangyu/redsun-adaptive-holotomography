@@ -29,6 +29,7 @@ from redsun_aht.device.software_stepped_plan import _Plane
 from redsun_aht.device.unimmcore_triggered_camera import UniMMCoreTriggeredCamera
 from redsun_aht.plans.dpct import _bounded_call
 from redsun_aht.plans.hand_eye import HAND_EYE_AXES, calibration_waypoints, signed_offsets
+from redsun_aht.plans.survey_stack import z_targets
 from redsun_aht.robotic.device.asi._service import AsiFilterWheel, AsiSerialStage
 from redsun_aht.robotic.device.auxiliary import LumencorSpectra, UnifiedEmmsh
 from redsun_aht.robotic.device.workcell_webcam import WorkcellWebcam
@@ -47,22 +48,6 @@ Channel = Literal["off", "brightfield", "514_teal", "640_red", "470_cyan", "561_
 RotaryAxis = Literal["roll", "pitch", "yaw"]
 CHANNELS = get_args(Channel)
 FILTER_SLOTS = ("610BP60", "555BP30", "676BP34", "open", "closed", "470BP24", "518BP32", "632BP60")
-
-
-def z_targets(origin: float, step_um: float, planes: int) -> tuple[float, ...]:
-    """Validate a relative, monotone stack before issuing any move."""
-    if type(planes) is not int or not 1 <= planes <= 32:
-        raise ValueError("planes must be 1..32")
-    if not math.isfinite(origin) or not math.isfinite(step_um):
-        raise ValueError("origin and step must be finite")
-    if planes > 1 and (step_um == 0 or abs(step_um) * (planes - 1) > 1000):
-        raise ValueError("stack must have a nonzero step and span at most 1000 um")
-    targets = tuple(origin + index * step_um for index in range(planes))
-    if not all(math.isfinite(target) for target in targets):
-        raise ValueError("stack target is not finite")
-    if len(set(targets)) != planes:
-        raise ValueError("stack step is too small to produce distinct Z targets")
-    return targets
 
 
 class ArhPresenter:

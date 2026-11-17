@@ -73,8 +73,11 @@ async def test_typed_client_runs_against_loopback_service():
 
 
 async def test_correlated_x_state_over_pva():
+    from redsun.engine import RunEngine
+
     from redsun_aht.device.pva_unified_mcu import PvaUnifiedMcu
     from redsun_aht.device.pva_x_state import PvaXState
+    from redsun_aht.presenter.holospim import HolospimPresenter
 
     prefix = "UT" + uuid.uuid4().hex[:12].upper()
     port = FakePort()
@@ -90,8 +93,19 @@ async def test_correlated_x_state_over_pva():
         await owner.reserve()
         state = await client.read_state()
         assert state.position_tenths == 0 and state.motor_flags == 3
+        docs = []
+        engine = RunEngine({})
+        plan = HolospimPresenter("test").x28_readback(owner)
+        future = engine(plan, {"event": lambda _, doc: docs.append(doc["data"])})
+        await asyncio.wait_for(asyncio.wrap_future(future), 10)
+        assert docs == [{
+            "target_tenths": 0, "position_tenths": 0,
+            "speed_tenths_rpm": 0, "error_hundredths_degree": 0,
+            "home_flags": 3, "motor_flags": 3, "raw_hex": state.raw_hex,
+            "quality": "controller_reported",
+        }]
         await owner.release_reservation()
-        assert port.commands == ["identity", "00", "zasyncxstate"]
+        assert port.commands == ["identity", "00", "zasyncxstate", "zasyncxstate"]
     finally:
         server.cancel()
         await asyncio.gather(server, return_exceptions=True)
@@ -652,3 +666,99 @@ async def test_autonomous_stack_through_reserved_pva_service():
     finally:
         server.cancel()
         await asyncio.gather(server, return_exceptions=True)
+
+
+@pytest.mark.parametrize("cancel", [None, "stop", "task"])
+async def test_x28_point_move_uses_service_bounds_and_shared_owner(cancel):
+    from redsun_aht.device.pva_unified_mcu import PvaUnifiedMcu
+
+    class JogPort(FakePort):
+        async def write(self, data):
+            replies = {
+                b"IP?\n": "IP protocol=1 pixels=91 ids=6-13 loaded=0",
+                b"DPCAPS?\n": "DPCAPS 1 91 5 20 1",
+                b"zabs 18\n": "Z result=0",
+            }
+            if data in replies:
+                self.commands.append(data.decode().strip())
+                if data == b"zabs 18\n":
+                    self.started.set()
+                    if cancel:
+                        return len(data)
+                    self.x_position = 18
+                self.emit(replies[data])
+                return len(data)
+            return await super().write(data)
+
+    prefix = "UT" + uuid.uuid4().hex[:12].upper()
+    port = JogPort()
+    controller = UnifiedMcuController(
+        UnifiedMcu(port), require_holospim_panel=True, x28_jog_bounds_tenths=(-36, 36),
+    )
+    server = asyncio.create_task(serve_controller(controller, EpicsPVATransport(), prefix))
+    client = PvaUnifiedMcu(
+        prefix + ":", name="owner", x28_um_per_turn=1000,
+        x28_jog_bounds_tenths=(-36, 36),
+    )
+    context = Context("pva")
+    request = {"request_id": uuid.uuid4().hex, "target": 37}
+    try:
+        await asyncio.wait_for(client.connect(), 10)
+        with pytest.raises(Exception, match="target outside configured bounds"):
+            await asyncio.wait_for(context.put(prefix + ":XMoveRequest", json.dumps(request)), 5)
+        await client.reserve()
+        request["target"] = 18
+        with pytest.raises(Exception, match="busy or reserved"):
+            await asyncio.wait_for(context.put(prefix + ":XMoveRequest", json.dumps(request)), 5)
+        await client.release_reservation()
+        await asyncio.wait_for(context.put(prefix + ":XMoveCancel", request["request_id"]), 5)
+        with pytest.raises(Exception, match="cancelled before admission"):
+            await asyncio.wait_for(context.put(prefix + ":XMoveRequest", json.dumps(request)), 5)
+        if cancel:
+            move = asyncio.create_task(client.move_x_absolute(18))
+            await asyncio.wait_for(port.started.wait(), 3)
+            if cancel == "task":
+                move.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await move
+            else:
+                await client.stop_x_move()
+                with pytest.raises(Exception, match="stop unverified"):
+                    await move
+            assert controller.owner.uncertain
+            last_command = "zstop"
+        else:
+            await client.x28.set(5)
+            last_command = "zasyncxstate"
+        assert port.commands.count("zabs 18") == 1
+        move_index = port.commands.index("zabs 18")
+        assert port.commands[move_index - 2:move_index] == [
+            "zasyncxconfig", "zasyncxstate",
+        ]
+        readbacks = port.commands[move_index + 1:]
+        assert set(readbacks) == {last_command}
+        assert len(readbacks) == 1 if cancel else len(readbacks) > 1
+        if not cancel:
+            assert await client.x28.locate() == {"setpoint": 5, "readback": 5}
+    finally:
+        context.close()
+        server.cancel()
+        await asyncio.gather(server, return_exceptions=True)
+
+
+async def test_x28_mock_axis_is_discoverable_without_a_serial_connection():
+    from redsun.presenter._positioner import boxes
+
+    from redsun_aht.device.pva_unified_mcu import PvaUnifiedMcu
+
+    owner = PvaUnifiedMcu(
+        "UNUSED:", name="mcu", x28_um_per_turn=-1000,
+        x28_jog_bounds_tenths=(-36, 72),
+    )
+    await owner.connect(mock=True)
+    assert boxes({"mcu": owner})["mcu"][1] == {"x28": owner.x28}
+    await owner.x28.set(-5)
+    assert owner.x28._mock_position == 18
+    assert await owner.x28.locate() == {"setpoint": -5, "readback": -5}
+    with pytest.raises(ValueError, match="outside"):
+        await owner.x28.set(10.001)

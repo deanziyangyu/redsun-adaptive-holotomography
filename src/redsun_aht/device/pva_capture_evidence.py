@@ -15,6 +15,27 @@ if TYPE_CHECKING:
     from redsun_aht.device.mmcore.camera import MMCamera
 
 
+async def require_idle_camera(
+    camera: MMCamera, *, internal_trigger: bool = False
+) -> None:
+    """Verify idle service state and optionally the reported internal trigger mode."""
+    if (
+        await camera.acquire.get_value(cached=False)
+        or await camera.capture.get_value(cached=False)
+        or await camera.sequence_started.get_value(cached=False)
+    ):
+        raise RuntimeError("camera service is not idle")
+    if internal_trigger:
+        if await camera.state.get_value(cached=False) != "idle":
+            raise RuntimeError("camera service is not reporting idle state")
+        for name, signal in camera.properties.items():
+            if name.replace("_", "").casefold() == "triggermode":
+                mode = await signal.get_value(cached=False)
+                if mode.casefold() in ("off", "internal trigger"):
+                    return
+        raise RuntimeError("camera is not reporting internal trigger mode")
+
+
 @dataclass(frozen=True, slots=True)
 class CaptureEvidence:
     """A bounded store count; frames have no inferred stage association."""
@@ -81,12 +102,7 @@ class PvaCaptureEvidence:
             raise ValueError("frame count must be 1..2048")
         self._used = True
         camera = self.camera
-        if (
-            await camera.acquire.get_value(cached=False)
-            or await camera.capture.get_value(cached=False)
-            or await camera.sequence_started.get_value(cached=False)
-        ):
-            raise RuntimeError("camera service is not idle")
+        await require_idle_camera(camera)
         self._uri, self._count = uri, count
         await camera.file_path.set(uri)
         await camera.num_capture.set(count)

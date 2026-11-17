@@ -5,9 +5,10 @@ from __future__ import annotations
 import asyncio
 import math
 from functools import cached_property
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Any, cast
 
 from ophyd_async.core import (
+    DEFAULT_TIMEOUT,
     Device,
     MovableLogic,
     SignalR,
@@ -22,7 +23,7 @@ from ophyd_async.fastcs.core import fastcs_connector
 from redsun_aht.device.pva_unified_mcu import PvaUnifiedMcu
 
 if TYPE_CHECKING:
-    from ophyd_async.core import TimeoutCalculator
+    from ophyd_async.core import DeviceMock, TimeoutCalculator
 
     from redsun_aht.device.unified_mcu import RotationState
 
@@ -97,6 +98,8 @@ class RotationLogic(MovableLogic[float]):
 
     async def stop(self) -> None:
         """Request a decelerated firmware stop."""
+        if self.axis.simulated:
+            return
         state = await self.axis.mcu.rotation("stop")
         while state.moving:
             await asyncio.sleep(0.05)
@@ -130,6 +133,8 @@ class PvaRotationAxis(StandardReadable, StandardMovable[float]):
         self.steps_per_turn = steps_per_revolution * gear_ratio
         self.direction = direction
         self.timeout = timeout
+        self.simulated = False
+        self._simulated_steps = 0
         self.mcu = RotationClient(prefix)
         self.position = soft_signal_rw(
             float,
@@ -141,6 +146,18 @@ class PvaRotationAxis(StandardReadable, StandardMovable[float]):
         self.setpoint = soft_signal_rw(float, 0.0, units="deg", setter=self._move)
         super().__init__(name=name)
         self.add_readables([self.position], StandardReadableFormat.HINTED_SIGNAL)
+
+    async def connect(
+        self,
+        mock: bool | DeviceMock[Any] = False,
+        timeout: float = DEFAULT_TIMEOUT,
+        force_reconnect: bool = False,
+    ) -> None:
+        """Use a local step counter when the entire service is mocked."""
+        await super().connect(
+            mock=mock, timeout=timeout, force_reconnect=force_reconnect
+        )
+        self.simulated = bool(mock)
 
     def to_steps(self, degrees: float) -> int:
         """Convert degrees to the nearest assumed physical step."""
@@ -157,12 +174,19 @@ class PvaRotationAxis(StandardReadable, StandardMovable[float]):
 
     async def read_position(self) -> float:
         """Read the firmware's software step counter in assumed degrees."""
+        if self.simulated:
+            return self.to_degrees(self._simulated_steps)
         return self.to_degrees((await self.mcu.rotation("read")).position)
 
     async def _move(self, degrees: float | None) -> float:
         if degrees is None:
             raise ValueError("rotation target required")
         target = self.to_steps(degrees)
+        if self.simulated:
+            self._simulated_steps = target
+            position = self.to_degrees(target)
+            await self.position.set(position)
+            return position
         await self.mcu.reserve()
         try:
             return await self._move_reserved(target)
@@ -197,6 +221,10 @@ class PvaRotationAxis(StandardReadable, StandardMovable[float]):
 
     async def zero(self) -> None:
         """Set the stationary software counter to zero without homing."""
+        if self.simulated:
+            self._simulated_steps = 0
+            await self.position.set(0.0)
+            return
         state = await self.mcu.rotation("read")
         if state.moving:
             raise RuntimeError("cannot zero a moving rotation axis")
@@ -205,6 +233,8 @@ class PvaRotationAxis(StandardReadable, StandardMovable[float]):
 
     async def disable(self) -> None:
         """Remove coil drive; position may change without being detected."""
+        if self.simulated:
+            return
         await self.mcu.rotation("disable")
 
 
@@ -220,7 +250,11 @@ class PvaRotationMotor(StandardReadable):
         gear_ratio: float = 1,
         direction: int = -1,
         timeout: float = 120,
+        enable_controller_jog: bool = False,
     ) -> None:
+        if type(enable_controller_jog) is not bool:
+            raise ValueError("enable_controller_jog must be a boolean")
+        self.enable_controller_jog = enable_controller_jog
         self.rotation = PvaRotationAxis(
             prefix,
             steps_per_revolution=steps_per_revolution,

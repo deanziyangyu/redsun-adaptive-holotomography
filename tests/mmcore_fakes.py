@@ -250,6 +250,17 @@ class FakeCameraCore:
         return self.exposure_limits
 
 
+class InternalTriggerCameraCore(FakeCameraCore):
+    """Fake camera with a writable trigger-mode readback."""
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.properties["TriggerMode"] = "Internal Trigger"
+
+    def isPropertyReadOnly(self, label: str, name: str) -> bool:
+        return name != "TriggerMode" and super().isPropertyReadOnly(label, name)
+
+
 class MemoryFrameStore:
     """Keep written arrays observable without constructing a Zarr store."""
 

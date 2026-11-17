@@ -311,18 +311,15 @@ class MMStage(StandardReadable, Loggable):
                 quality=QualityLabel.UNAVAILABLE,
             )
         measured = provenance == "measured"
-        readings = tuple(
-            [
-                AxisReading(
-                    name=name,
-                    value=float(location["readback"]),
-                    setpoint=float(location["setpoint"]),
-                    measured=measured,
-                )
-                for name, axis in self.axis.items()
-                for location in [await axis.locate()]
-            ]
-        )
+        readings = []
+        for name, axis in self.axis.items():
+            location = await axis.locate()
+            value = float(location["readback"])
+            target = float(location["setpoint"])
+            if not (math.isfinite(value) and math.isfinite(target)):
+                readings.clear()
+                break
+            readings.append(AxisReading(name, value, target, measured))
         if not readings:
             return StageReading(
                 axes=(),
@@ -330,7 +327,7 @@ class MMStage(StandardReadable, Loggable):
                 quality=QualityLabel.UNAVAILABLE,
             )
         return StageReading(
-            axes=readings,
+            axes=tuple(readings),
             monotonic_ns=time.monotonic_ns(),
             quality=QualityLabel.MEASURED if measured else QualityLabel.SIMULATED,
         )

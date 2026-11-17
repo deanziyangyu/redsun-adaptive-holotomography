@@ -1,11 +1,13 @@
 """Fake-only ESP300 PA/MD/TP transport checks."""
 
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor
+from threading import Event
 
 import pytest
 
 from redsun_aht.device.esp300_readonly import AxisSnapshot
-from redsun_aht.device.esp300_z_serial import Esp300ZSerial
+from redsun_aht.device.esp300_z_serial import Esp300SurveySerial, Esp300ZSerial
 
 
 class Port:
@@ -76,7 +78,12 @@ def test_bad_admission_and_out_of_bounds_never_move():
     assert port.writes == []
 
 
-def test_wrong_final_position_latches_uncertainty_without_replay():
+def test_wrong_final_position_latches_uncertainty_without_replay(monkeypatch):
+    ticks = iter([0.0, 11.0])
+    monkeypatch.setattr(
+        "redsun_aht.device.esp300_z_serial.time",
+        type("Timer", (), {"monotonic": staticmethod(lambda: next(ticks))}),
+    )
     port = Port([b"1\r\n", b"0\r\n", b"0\r\n", b"1\r\n", b"0.004\r\n"])
     stage = make(port)
     with pytest.raises(RuntimeError, match="match target"):
@@ -93,6 +100,117 @@ def test_stop_inhibits_further_requests():
     with pytest.raises(RuntimeError, match="uncertain"):
         stage.move_and_settle_mm(0.005)
     assert port.writes == [b"3ST\r"]
+
+
+def test_failed_stop_write_can_be_retried_without_unlatching():
+    class ShortWritePort(Port):
+        def write(self, data):
+            count = super().write(data)
+            return count - 1 if len(self.writes) == 1 else count
+
+    port = ShortWritePort()
+    stage = make(port)
+    with pytest.raises(OSError, match="short"):
+        stage.stop()
+    with pytest.raises(RuntimeError, match="uncertain"):
+        stage.move_and_settle_mm(0.005)
+    stage.stop()
+    stage.stop()
+    assert port.writes == [b"3ST\r", b"3ST\r"]
+
+
+def xyz_snapshot_replies():
+    return [b"ESP300\r\n"] + [
+        line + b"\r\n"
+        for index in range(1, 4)
+        for line in (
+            str(index).encode(),
+            b"2",
+            b"0.0001",
+            b"0",
+            b"12.5",
+            b"0",
+            b"0",
+            b"1",
+        )
+    ]
+
+
+@pytest.mark.parametrize("stop_during_preflight", (False, True))
+def test_stop_during_serial_query_cancels_current_and_queued_moves(
+    stop_during_preflight,
+):
+    entered, release = Event(), Event()
+
+    class BlockingPort(Port):
+        def readline(self, size=-1):
+            command = self.writes[-1]
+            if stop_during_preflight:
+                interrupt = command == b"VE?\r" and self.writes.count(command) == 2
+            else:
+                interrupt = command == b"3MD?\r" and b"3PA0.005\r" in self.writes
+            if interrupt:
+                entered.set()
+                assert release.wait(3)
+            return super().readline(size)
+
+    port = BlockingPort(
+        xyz_snapshot_replies() * 2 + [b"1\r\n", b"1\r\n", b"0\r\n", b"0\r\n", b"0\r\n"]
+    )
+    survey = Esp300SurveySerial(port, (("1", 0, 10), ("2", 0, 10), ("3", 0, 10)))
+    with ThreadPoolExecutor(max_workers=3) as threads:
+        move = threads.submit(survey.move_um, 3, 5)
+        try:
+            assert entered.wait(3)
+            queued = threads.submit(survey.move_um, 1, 5)
+            stop = threads.submit(survey.stop)
+            assert survey._uncertain.wait(3)
+        finally:
+            release.set()
+        stop.result(3)
+        with pytest.raises(RuntimeError, match=r"stop requested|uncertain"):
+            move.result(3)
+        with pytest.raises(RuntimeError, match="uncertain"):
+            queued.result(3)
+    expected = [] if stop_during_preflight else [b"3PA0.005\r", b"3ST\r"]
+    assert [line for line in port.writes if not line.endswith(b"?\r")] == expected
+
+
+@pytest.mark.parametrize("axis", [1, 2, 3])
+@pytest.mark.parametrize("settled", [True, False])
+def test_xyz_owner_moves_only_selected_axis_and_stops_on_unverified_readback(
+    axis, settled, monkeypatch
+):
+    snapshot_replies = xyz_snapshot_replies()
+    initial_poll = [b"1\r\n", b"0\r\n"]
+    final_poll = [b"1\r\n", b"0.005\r\n"] if settled else []
+    if not settled:
+        ticks = iter([0.0, 11.0])
+        monkeypatch.setattr(
+            "redsun_aht.device.esp300_z_serial.time",
+            type("Timer", (), {"monotonic": staticmethod(lambda: next(ticks))}),
+        )
+    port = Port(
+        snapshot_replies * 2
+        + [b"1\r\n", b"1\r\n", b"0\r\n", b"0\r\n"]
+        + initial_poll
+        + final_poll
+    )
+    survey = Esp300SurveySerial(port, (("1", 0, 10), ("2", 0, 10), ("3", 0, 10)))
+    before = list(port.writes)
+    with pytest.raises(ValueError, match="bounds"):
+        survey.move_um(axis, 20)
+    assert port.writes == before
+    if settled:
+        survey.move_um(axis, 5)
+        expected = [f"{axis}PA0.005\r".encode()]
+    else:
+        with pytest.raises(RuntimeError, match="match target"):
+            survey.move_um(axis, 5)
+        expected = [f"{axis}PA0.005\r".encode(), f"{axis}ST\r".encode()]
+        with pytest.raises(RuntimeError, match="uncertain"):
+            survey.snapshot()
+    assert [line for line in port.writes if not line.endswith(b"?\r")] == expected
 
 
 def test_registered_unimmcore_stage_uses_fake_serial_transport():

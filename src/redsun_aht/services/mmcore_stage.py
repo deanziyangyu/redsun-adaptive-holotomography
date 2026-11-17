@@ -59,7 +59,7 @@ from fastcs.transports.epics.pva.transport import EpicsPVATransport
 from redsun.services import configure_logging, identity, serve_controller
 
 if TYPE_CHECKING:
-    from collections.abc import Coroutine, Iterable, Mapping
+    from collections.abc import Callable, Coroutine, Iterable, Mapping
 
     from pymmcore_plus import CMMCorePlus
 
@@ -321,7 +321,23 @@ class MotionProfileIO(AttributeIO[str, AttributeIORef]):  # type: ignore[misc]
             )
 
 
-class StageIO(AttributeIO[float, AxisRef]):  # type: ignore[misc]
+class AxisPositionIO(AttributeIO[float, AxisRef]):  # type: ignore[misc]
+    """Backend interface for the shared PVA positioner groups."""
+
+    def limits_for(self, axis: str) -> tuple[float, float]:
+        """Return the enforced travel bounds for an axis."""
+        raise NotImplementedError
+
+    def precision_for(self, axis: str) -> tuple[float, str]:
+        """Return the step size and its source for an axis."""
+        raise NotImplementedError
+
+    def stop(self) -> None:
+        """Request a stage stop."""
+        raise NotImplementedError
+
+
+class StageIO(AxisPositionIO):
     """Reads and moves one stage through Micro-Manager.
 
     *limits* are the travel bounds the service enforces, in the units the
@@ -467,7 +483,7 @@ class StageIO(AttributeIO[float, AxisRef]):  # type: ignore[misc]
 class MMAxisController(Controller):  # type: ignore[misc]
     """One axis of the stage: its position, its limits and its stop request."""
 
-    def __init__(self, axis: str, io: StageIO) -> None:
+    def __init__(self, axis: str, io: AxisPositionIO) -> None:
         super().__init__(ios=[io])
         self._io = io
         self._axis = axis
@@ -510,7 +526,10 @@ class MMStageGroup(Controller):  # type: ignore[misc]
     """The stage itself: its named axes and its stage-wide stop request."""
 
     def __init__(
-        self, io: StageIO, axes: Iterable[str], provenance: str = "unknown"
+        self, io: AxisPositionIO, axes: Iterable[str], provenance: str = "unknown",
+        *,
+        axis_controller: Callable[[str, AxisPositionIO], MMAxisController]
+        = MMAxisController,
     ) -> None:
         super().__init__(ios=[io])
         self._io = io
@@ -523,7 +542,7 @@ class MMStageGroup(Controller):  # type: ignore[misc]
         )
         group = Controller(ios=[io])
         for axis in axes:
-            group.add_sub_controller(axis, MMAxisController(axis, io))
+            group.add_sub_controller(axis, axis_controller(axis, io))
         self.add_sub_controller("axis", group)
         self.stop_request = AttrRW(
             Bool(),

@@ -1,6 +1,7 @@
 """Open-loop rotation conversion and the complete fake-serial PVA path."""
 
 import asyncio
+import json
 import uuid
 
 import pytest
@@ -63,7 +64,9 @@ async def test_rotation_axis_over_pva():
     port = RotationPort()
     server = asyncio.create_task(
         serve_controller(
-            UnifiedMcuController(UnifiedMcu(port)), EpicsPVATransport(), prefix
+            UnifiedMcuController(UnifiedMcu(port), roll_bounds_steps=(-10, 10)),
+            EpicsPVATransport(),
+            prefix,
         )
     )
     motor = PvaRotationMotor(prefix + ":", name="rotation_motor")
@@ -81,6 +84,45 @@ async def test_rotation_axis_over_pva():
     finally:
         server.cancel()
         await asyncio.gather(server, return_exceptions=True)
+
+
+@pytest.mark.parametrize(
+    ("bounds", "action", "steps", "reason"),
+    [
+        (None, "enable", None, "configure HoloSPIM roll bounds"),
+        ((-10, 10), "move", 11, "exceeds configured step bounds"),
+        ((-10, 10), "zero", None, "invalidate the configured step bounds"),
+    ],
+)
+async def test_roll_admission_rejects_unconfigured_or_out_of_bounds_actions(
+    bounds, action, steps, reason
+):
+    port = RotationPort()
+    controller = UnifiedMcuController(
+        UnifiedMcu(port),
+        require_holospim_panel=True,
+        roll_bounds_steps=bounds,
+    )
+    request = json.dumps(
+        {"id": uuid.uuid4().hex, "action": action, "steps": steps, "token": None}
+    )
+    with pytest.raises((RuntimeError, ValueError), match=reason):
+        await controller._rotation(controller.rotation_request, request)
+    assert not port.commands
+
+
+async def test_bounded_roll_checks_the_current_counter_before_enabling_outputs():
+    port = RotationPort()
+    port.position = 11
+    owner = UnifiedMcu(port)
+    await owner.identify()
+    controller = UnifiedMcuController(owner, roll_bounds_steps=(-10, 10))
+    request = json.dumps(
+        {"id": uuid.uuid4().hex, "action": "enable", "steps": None, "token": None}
+    )
+    with pytest.raises(RuntimeError, match="outside configured bounds"):
+        await controller._rotation(controller.rotation_request, request)
+    assert port.commands == ["identity", "rot?"]
 
 
 async def test_positioner_jogs_rotation_in_degrees():

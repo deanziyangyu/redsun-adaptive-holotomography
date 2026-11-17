@@ -2,12 +2,69 @@
 
 import asyncio
 import json
+from unittest.mock import AsyncMock
 
 import pytest
 from ophyd_async.core import get_mock_put, set_mock_value
 
 from redsun_aht.device.pva_unified_mcu import PvaUnifiedMcu, parse_progress
-from redsun_aht.device.unified_mcu import AngularStack
+from redsun_aht.device.unified_mcu import (
+    IDENTITY,
+    AngularStack,
+    UnifiedMcu,
+    UnifiedMcuError,
+)
+from redsun_aht.services.unified_mcu import UnifiedMcuController
+
+
+@pytest.mark.parametrize(
+    "panel, accepted",
+    [
+        ("IP protocol=1 pixels=91 ids=6-13 loaded=255", True),
+        ("IP protocol=1 pixels=91 ids=6-13 loaded=256", False),
+        ("IP protocol=1 pixels=61 ids=6-13 loaded=0", False),
+        ("Invalid command", False),
+    ],
+)
+async def test_holospim_service_requires_panel_capability_before_startup(
+    panel, accepted
+):
+    port = AsyncMock()
+    port.write.side_effect = len
+    port.read_until.side_effect = [
+        (line + "\n").encode() for line in (IDENTITY, panel, "DPCAPS 1 91 5 20 1", "0")
+    ]
+    owner = UnifiedMcu(port)
+    controller = UnifiedMcuController(owner, require_holospim_panel=True)
+    if accepted:
+        await controller.initialise()
+        expected = [b"identity\n", b"IP?\n", b"DPCAPS?\n", b"00\n"]
+    else:
+        with pytest.raises(UnifiedMcuError, match="HoloSPIM firmware capabilities"):
+            await controller.initialise()
+        assert owner.uncertain
+        expected = [b"identity\n", b"IP?\n"]
+    assert [call.args[0] for call in port.write.await_args_list] == expected
+
+
+@pytest.mark.parametrize("response", ("ERR invalid_command", "DPCAPS 1 61 5 20 1"))
+async def test_holospim_service_rejects_missing_91_pixel_dynamic_bank(response):
+    port = AsyncMock()
+    port.write.side_effect = len
+    port.read_until.side_effect = [
+        (line + "\n").encode()
+        for line in (IDENTITY, "IP protocol=1 pixels=91 ids=6-13 loaded=0", response)
+    ]
+    owner = UnifiedMcu(port)
+    controller = UnifiedMcuController(owner, require_holospim_panel=True)
+    with pytest.raises(RuntimeError, match="dynamic pattern protocol"):
+        await controller.initialise()
+    assert owner.uncertain
+    assert [call.args[0] for call in port.write.await_args_list] == [
+        b"identity\n",
+        b"IP?\n",
+        b"DPCAPS?\n",
+    ]
 
 
 async def test_one_request_and_strict_result():

@@ -84,6 +84,22 @@ class Esp300ReadOnly:
             raise RuntimeError("nonfinite ESP300 numeric response")
         return value
 
+    def motor_power(self, axis: int) -> bool:
+        """Read the controller's power flag without enabling the motor."""
+        if type(axis) is not int or not 1 <= axis <= 3:
+            raise ValueError("expected an ESP300 axis number in 1..3")
+        with self._lock:
+            if self._uncertain:
+                raise RuntimeError("serial stream uncertain; reopen and reconcile")
+            try:
+                value = self._query(f"{axis}MO")
+                if value not in ("0", "1"):
+                    raise RuntimeError("invalid ESP300 motor power flag")
+                return value == "1"
+            except BaseException:
+                self._uncertain = True
+                raise
+
     def snapshot(self) -> ControllerSnapshot:
         """Query identity and axes; never enable, home, move, stop, or clear errors."""
         with self._lock:

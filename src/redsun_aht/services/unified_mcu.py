@@ -12,6 +12,7 @@ import json
 import logging
 import re
 import sys
+from collections import deque
 from dataclasses import asdict
 
 from fastcs.attributes import AttrR, AttrW
@@ -20,6 +21,7 @@ from fastcs.datatypes import Bool, Int, String
 from fastcs.transports.epics.pva.transport import EpicsPVATransport
 from redsun.services import serve_controller
 
+from redsun_aht.device.dynamic_patterns import DynamicPattern
 from redsun_aht.device.unified_mcu import AngularStack, UnifiedMcu, open_unified_port
 
 logger = logging.getLogger(__name__)
@@ -28,9 +30,38 @@ logger = logging.getLogger(__name__)
 class UnifiedMcuController(Controller):  # type: ignore[misc]
     """Experimental service; reservation is cooperative, not authorization."""
 
-    def __init__(self, owner: UnifiedMcu) -> None:
+    def __init__(
+        self,
+        owner: UnifiedMcu,
+        *,
+        require_holospim_panel: bool = False,
+        roll_bounds_steps: tuple[int, int] | None = None,
+        x28_jog_bounds_tenths: tuple[int, int] | None = None,
+    ) -> None:
         super().__init__()
         self.owner = owner
+        self._require_holospim_panel = require_holospim_panel
+        if roll_bounds_steps is not None:
+            lower, upper = roll_bounds_steps
+            if (
+                type(lower) is not int
+                or type(upper) is not int
+                or not -(2**31) <= lower < upper < 2**31
+            ):
+                raise ValueError("roll bounds must be increasing signed step counts")
+        self._roll_bounds_steps = roll_bounds_steps
+        self._x28_jog_bounds = x28_jog_bounds_tenths
+        self._x_move_task: tuple[str, asyncio.Task] | None = None
+        self._cancelled_x_moves: deque[str] = deque(maxlen=32)
+        if x28_jog_bounds_tenths is not None:
+            lower, upper = x28_jog_bounds_tenths
+            if (
+                not require_holospim_panel
+                or type(lower) is not int
+                or type(upper) is not int
+                or not -3600 <= lower < upper <= 3600
+            ):
+                raise ValueError("X28 jog requires HoloSPIM and valid angular bounds")
         self._lock = asyncio.Lock()
         self._active_task: asyncio.Task[object] | None = None
         self._closing = False
@@ -39,6 +70,15 @@ class UnifiedMcuController(Controller):  # type: ignore[misc]
         self._shot_pending: tuple[str, int, int] | None = None
         self._shot_context: tuple[str, int] | None = None
         self.request = AttrW(String(), description="Finite angular stack JSON")
+        self.dynamic_pattern_request = AttrW(
+            String(), description="Reserved 91-pixel map upload"
+        )
+        self.dynamic_pattern_result = AttrR(
+            String(), initial_value="", description="Correlated dynamic map receipt"
+        )
+        self.dynamic_shot_request = AttrW(
+            String(), description="Reserved dynamic software-shot recipe"
+        )
         self.shot_request = AttrW(
             String(), description="Finite software-shot request JSON"
         )
@@ -81,6 +121,11 @@ class UnifiedMcuController(Controller):  # type: ignore[misc]
         self.x_state_result = AttrR(
             String(), initial_value="", description="Controller-reported X state"
         )
+        self.x_move_request = AttrW(String(), description="Bounded X28 move JSON")
+        self.x_move_result = AttrR(
+            String(), initial_value="", description="Correlated settled X28 state"
+        )
+        self.x_move_cancel = AttrW(String(), description="Cancel a matching X28 move")
         self.rotation_request = AttrW(
             String(), description="Open-loop rotation command JSON"
         )
@@ -108,11 +153,15 @@ class UnifiedMcuController(Controller):  # type: ignore[misc]
         self.trigger_output.set_on_put_callback(self._trigger_output)
         self.reservation.set_on_put_callback(self._reservation_command)
         self.x_state_request.set_on_put_callback(self._x_state)
+        self.x_move_request.set_on_put_callback(self._x_move)
+        self.x_move_cancel.set_on_put_callback(self._cancel_x_move)
         self.rotation_request.set_on_put_callback(self._rotation)
+        self.dynamic_pattern_request.set_on_put_callback(self._upload_dynamic_pattern)
+        self.dynamic_shot_request.set_on_put_callback(self._run_dynamic_shots)
 
     async def initialise(self) -> None:
         """Verify dialect and blank before accepting operations."""
-        await self.owner.identify()
+        await self.owner.identify(require_holospim_panel=self._require_holospim_panel)
         await self.owner.illumination("00")
 
     async def _run(self, attr: AttrW, value: str) -> None:
@@ -275,25 +324,16 @@ class UnifiedMcuController(Controller):  # type: ignore[misc]
                 async def ready(
                     shot: int, plane: int, pattern: int, target: int
                 ) -> None:
-                    waiter = asyncio.get_running_loop().create_future()
-                    self._shot_waiter = waiter
-                    self._shot_pending = (token, definition.run_id, shot)
-                    await self.shot_ready.update(
-                        json.dumps(
-                            {
-                                "run_id": definition.run_id,
-                                "shot": shot,
-                                "plane": plane,
-                                "pattern": pattern,
-                                "target_tenths": target,
-                            }
-                        )
+                    await self._publish_ready(
+                        token,
+                        definition.run_id,
+                        shot,
+                        {
+                            "plane": plane,
+                            "pattern": pattern,
+                            "target_tenths": target,
+                        },
                     )
-                    try:
-                        await asyncio.wait_for(waiter, 20.0)
-                    finally:
-                        self._shot_waiter = None
-                        self._shot_pending = None
 
                 await self.owner.software_shots(
                     definition,
@@ -311,6 +351,106 @@ class UnifiedMcuController(Controller):  # type: ignore[misc]
                 self._shot_context = None
                 await self.busy.update(False)
                 self._active_task = None
+
+    async def _publish_ready(
+        self, token: str, run_id: int, shot: int, fields: dict[str, int | str]
+    ) -> None:
+        waiter = asyncio.get_running_loop().create_future()
+        self._shot_waiter = waiter
+        self._shot_pending = (token, run_id, shot)
+        try:
+            await self.shot_ready.update(
+                json.dumps(
+                    {
+                        "run_id": run_id,
+                        "shot": shot,
+                        **fields,
+                    }
+                )
+            )
+            await asyncio.wait_for(waiter, 20.0)
+        finally:
+            self._shot_waiter = None
+            self._shot_pending = None
+
+    async def _run_dynamic_shots(self, attr: AttrW, value: str) -> None:
+        del attr
+        if len(value) > 12288 or not value.isascii():
+            raise ValueError("invalid dynamic shot request length or encoding")
+        payload = json.loads(value)
+        if not isinstance(payload, dict) or set(payload) != {
+            "token",
+            "run_id",
+            "patterns",
+            "repeats",
+            "ready",
+        }:
+            raise ValueError("invalid dynamic shot request")
+        token, run_id, patterns, repeats, ready = (
+            payload[key] for key in ("token", "run_id", "patterns", "repeats", "ready")
+        )
+        if (
+            not isinstance(token, str)
+            or re.fullmatch(r"[0-9a-f]{32}", token) is None
+            or type(run_id) is not int
+            or not 1 <= run_id <= 2_147_483_647
+            or not isinstance(patterns, list)
+            or not 1 <= len(patterns) <= 64
+            or type(repeats) is not int
+            or not 1 <= repeats <= 32
+            or ready is not True
+        ):
+            raise ValueError("invalid dynamic shot fields")
+        receipts = []
+        for receipt in patterns:
+            if (
+                not isinstance(receipt, dict)
+                or set(receipt) != {"slot", "generation", "crc32", "sha256"}
+                or type(receipt["slot"]) is not int
+                or not 1 <= receipt["slot"] <= 5
+                or type(receipt["generation"]) is not int
+                or not 1 <= receipt["generation"] <= 0xFFFFFFFF
+                or type(receipt["crc32"]) is not int
+                or not 0 <= receipt["crc32"] <= 0xFFFFFFFF
+                or not isinstance(receipt["sha256"], str)
+                or re.fullmatch(r"[0-9a-f]{64}", receipt["sha256"]) is None
+            ):
+                raise ValueError("invalid dynamic pattern receipt")
+            receipts.append(DynamicPattern(**receipt))
+        if self._closing or self._lock.locked():
+            raise RuntimeError("unified MCU busy")
+        async with self._lock:
+            if token != self._reservation:
+                raise RuntimeError("reservation mismatch")
+            self._active_task = asyncio.current_task()
+            self._shot_context = (token, run_id)
+            try:
+                await self.busy.update(True)
+                await self.shot_ready.update("")
+
+                async def ready_frame(shot: int, pattern: DynamicPattern) -> None:
+                    await self._publish_ready(
+                        token,
+                        run_id,
+                        shot,
+                        {
+                            "mode": "dynamic",
+                            "slot": pattern.slot,
+                            "generation": pattern.generation,
+                        },
+                    )
+
+                await self.owner.dynamic_shots(
+                    receipts,
+                    repeats,
+                    ready_frame,
+                    camera_exclusive=True,
+                    illumination_ready=True,
+                )
+            finally:
+                self._shot_context = None
+                self._active_task = None
+                await self.busy.update(False)
 
     async def _confirm_shot(self, attr: AttrW, value: str) -> None:
         del attr
@@ -350,6 +490,48 @@ class UnifiedMcuController(Controller):  # type: ignore[misc]
             raise ValueError("abort requires a numeric run ID")
         await self.owner.abort(int(value))
 
+    async def _upload_dynamic_pattern(self, attr: AttrW, value: str) -> None:
+        del attr
+        if len(value) > 512 or not value.isascii():
+            raise ValueError("invalid dynamic map request length or encoding")
+        request = json.loads(value)
+        if not isinstance(request, dict) or set(request) != {
+            "id",
+            "token",
+            "slot",
+            "pixels",
+        }:
+            raise ValueError("invalid dynamic map request")
+        request_id, token, slot, pixels = (
+            request[k] for k in ("id", "token", "slot", "pixels")
+        )
+        if (
+            not isinstance(request_id, str)
+            or re.fullmatch(r"[0-9a-f]{32}", request_id) is None
+            or not isinstance(token, str)
+            or re.fullmatch(r"[0-9a-f]{32}", token) is None
+            or type(slot) is not int
+            or not 1 <= slot <= 5
+            or not isinstance(pixels, str)
+            or re.fullmatch(r"[0-9a-f]{182}", pixels) is None
+        ):
+            raise ValueError("invalid dynamic map fields")
+        if self._closing or self._lock.locked():
+            raise RuntimeError("unified MCU busy")
+        async with self._lock:
+            if token != self._reservation:
+                raise RuntimeError("reservation mismatch")
+            self._active_task = asyncio.current_task()
+            try:
+                receipt = await self.owner.upload_dynamic_pattern(
+                    slot, bytes.fromhex(pixels)
+                )
+                await self.dynamic_pattern_result.update(
+                    json.dumps({"id": request_id, **asdict(receipt)})
+                )
+            finally:
+                self._active_task = None
+
     async def _rotation(self, attr: AttrW, value: str) -> None:
         del attr
         if len(value.encode("utf-8")) > 512:
@@ -372,9 +554,31 @@ class UnifiedMcuController(Controller):  # type: ignore[misc]
         async with self._lock:
             if payload["token"] != self._reservation:
                 raise RuntimeError("reservation mismatch")
-            state = await self.owner.rotation_command(
-                payload["action"], payload["steps"]
-            )
+            action = payload["action"]
+            if action in ("enable", "move"):
+                bounds = self._roll_bounds_steps
+                if bounds is None:
+                    if self._require_holospim_panel:
+                        raise RuntimeError(
+                            "configure HoloSPIM roll bounds before motion"
+                        )
+                else:
+                    lower, upper = bounds
+                    steps = payload["steps"]
+                    if action == "move" and (
+                        type(steps) is not int or not lower <= steps <= upper
+                    ):
+                        raise ValueError("roll target exceeds configured step bounds")
+                    state = await self.owner.rotation_command("read")
+                    if state.moving or not lower <= state.position <= upper:
+                        raise RuntimeError(
+                            "roll counter is moving or outside configured bounds"
+                        )
+            elif action == "zero" and self._roll_bounds_steps is not None:
+                raise RuntimeError(
+                    "roll zero would invalidate the configured step bounds"
+                )
+            state = await self.owner.rotation_command(action, payload["steps"])
             await self.rotation_result.update(
                 json.dumps({"id": payload["id"], "state": asdict(state)})
             )
@@ -396,6 +600,73 @@ class UnifiedMcuController(Controller):  # type: ignore[misc]
                 )
             finally:
                 self._active_task = None
+
+    async def _x_move(self, attr: AttrW, value: str) -> None:
+        del attr
+        if len(value) > 128:
+            raise ValueError("X28 move request too large")
+        request = json.loads(value)
+        if (
+            not isinstance(request, dict)
+            or set(request) != {"request_id", "target"}
+            or not isinstance(request["request_id"], str)
+            or re.fullmatch(r"[a-f0-9]{32}", request["request_id"]) is None
+            or type(request["target"]) is not int
+        ):
+            raise ValueError("invalid X28 move request")
+        bounds = self._x28_jog_bounds
+        if bounds is None:
+            raise RuntimeError("X28 jog bounds are not configured")
+        if not bounds[0] <= request["target"] <= bounds[1]:
+            raise ValueError("X28 target outside configured bounds")
+        if self._closing or self._lock.locked() or self._reservation is not None:
+            raise RuntimeError("unified MCU busy or reserved")
+        request_id = request["request_id"]
+        async with self._lock:
+            if request_id in self._cancelled_x_moves:
+                raise RuntimeError("X28 move was cancelled before admission")
+            self._active_task = asyncio.current_task()
+            assert self._active_task is not None
+            move = asyncio.create_task(
+                self.owner.move_x_absolute(
+                    request["target"], lower=bounds[0], upper=bounds[1]
+                )
+            )
+            self._x_move_task = request_id, move
+            try:
+                await self.x_move_result.update("")
+                try:
+                    state = await asyncio.shield(move)
+                except asyncio.CancelledError:
+                    if request_id in self._cancelled_x_moves:
+                        raise RuntimeError(
+                            "X28 move cancelled; stop unverified"
+                        ) from None
+                    raise
+                await self.x_move_result.update(
+                    json.dumps({
+                        "request_id": request["request_id"], "state": asdict(state),
+                    })
+                )
+            finally:
+                if not move.done():
+                    if not move.cancelling():
+                        move.cancel()
+                    await asyncio.gather(move, return_exceptions=True)
+                self._x_move_task = None
+                self._active_task = None
+
+    async def _cancel_x_move(self, attr: AttrW, request_id: str) -> None:
+        del attr
+        if re.fullmatch(r"[a-f0-9]{32}", request_id) is None:
+            raise ValueError("invalid X28 cancellation ID")
+        if request_id in self._cancelled_x_moves:
+            return
+        self._cancelled_x_moves.append(request_id)
+        active = self._x_move_task
+        if active is not None and active[0] == request_id and not active[1].done():
+            active[1].cancel()
+            await asyncio.gather(active[1], return_exceptions=True)
 
     async def _illumination(self, attr: AttrW, value: str) -> None:
         del attr
@@ -494,9 +765,21 @@ class UnifiedMcuController(Controller):  # type: ignore[misc]
                 logger.error("Active stack cancellation timed out; stop unverified")
 
 
-async def _serve(port_name: str, prefix: str) -> None:
+async def _serve(
+    port_name: str,
+    prefix: str,
+    *,
+    require_holospim_panel: bool = False,
+    roll_bounds_steps: tuple[int, int] | None = None,
+    x28_jog_bounds_tenths: tuple[int, int] | None = None,
+) -> None:
     port = open_unified_port(port_name)
-    controller = UnifiedMcuController(UnifiedMcu(port))
+    controller = UnifiedMcuController(
+        UnifiedMcu(port),
+        require_holospim_panel=require_holospim_panel,
+        roll_bounds_steps=roll_bounds_steps,
+        x28_jog_bounds_tenths=x28_jog_bounds_tenths,
+    )
     try:
         await serve_controller(controller, EpicsPVATransport(), prefix)
     finally:
@@ -512,9 +795,44 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--port", required=True)
     parser.add_argument("--prefix", required=True)
+    parser.add_argument(
+        "--roll-bounds-steps",
+        nargs=2,
+        type=int,
+        metavar=("MIN", "MAX"),
+        help="allowed roll range in signed controller step counts",
+    )
+    parser.add_argument(
+        "--require-holospim-panel",
+        action="store_true",
+        help="require 91-pixel intensity and dynamic pattern banks",
+    )
+    parser.add_argument("--x28-jog-bounds-tenths", nargs=2, type=int,
+                        metavar=("MIN", "MAX"), help="commissioned X28 jog range")
     options = parser.parse_args(argv)
+    x28_bounds = options.x28_jog_bounds_tenths
+    if x28_bounds is not None and (
+        not options.require_holospim_panel
+        or not -3600 <= x28_bounds[0] < x28_bounds[1] <= 3600
+    ):
+        parser.error("X28 jog requires HoloSPIM and valid angular bounds")
+    bounds = options.roll_bounds_steps
+    if bounds is not None and not -(2**31) <= bounds[0] < bounds[1] < 2**31:
+        parser.error("roll bounds must be increasing signed step counts")
     try:
-        asyncio.run(_serve(options.port, options.prefix))
+        asyncio.run(
+            _serve(
+                options.port,
+                options.prefix,
+                require_holospim_panel=options.require_holospim_panel,
+                roll_bounds_steps=(bounds[0], bounds[1])
+                if bounds is not None
+                else None,
+                x28_jog_bounds_tenths=(x28_bounds[0], x28_bounds[1])
+                if x28_bounds is not None
+                else None,
+            )
+        )
     except KeyboardInterrupt:
         return 0
     return 0

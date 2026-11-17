@@ -6,9 +6,13 @@ from collections import Counter
 from uuid import uuid4
 
 import pytest
+from fastcs.transports.epics.pva.transport import EpicsPVATransport
+from redsun.services import serve_controller
 
+from redsun_aht.device.pva_unified_mcu import PvaUnifiedMcu
 from redsun_aht.device.unified_mcu import UnifiedMcu, UnifiedMcuError
 from redsun_aht.robotic.services.unified_emmsh import EmmshController
+from redsun_aht.services.unified_mcu import UnifiedMcuController
 
 
 class FirmwarePort:
@@ -84,9 +88,13 @@ async def test_redsun_upload_and_frame_retries(firmware):
     await owner.identify(due=True)
     firmware.delay.add("DPWRITE")
     firmware.drop["DPCOMMIT"] = 2
-    maps = [bytes((value * slot + slot) % 256 for value in range(61)) for slot in range(1, 6)]
+    maps = [
+        bytes((value * slot + slot) % 256 for value in range(61))
+        for slot in range(1, 6)
+    ]
     receipts = [
-        await owner.upload_dynamic_pattern(slot, data) for slot, data in enumerate(maps, 1)
+        await owner.upload_dynamic_pattern(slot, data)
+        for slot, data in enumerate(maps, 1)
     ]
     assert await firmware.state() == [0, 0, *([0] * 61)]
     assert firmware.commands["DPWRITE"] == 21
@@ -267,3 +275,65 @@ async def test_esp32_pattern_covers_all_91_leds_and_counts_ack_retries(firmware)
     assert frames == [(0, 5)]
     assert firmware.commands["DPACK"] == 2
     assert await firmware.state() == [1, 2, *([0] * 91)]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("firmware", ["ARH_DPCT_TEST_ESP32_FIRMWARE"], indirect=True)
+@pytest.mark.parametrize("fail_snap", [False, True])
+async def test_holospim_managed_protocol_acks_native_parser_frames(firmware, fail_snap):
+    prefix = "NATIVE" + uuid4().hex[:10].upper()
+    owner = UnifiedMcu(firmware, line_timeout_s=0.2)
+    server = asyncio.create_task(
+        serve_controller(UnifiedMcuController(owner), EpicsPVATransport(), prefix)
+    )
+    client = PvaUnifiedMcu(prefix + ":", name="mcu")
+    patterns = [
+        bytes((pixel * slot + slot) % 256 for pixel in range(91))
+        for slot in range(1, 6)
+    ]
+    observed = []
+    try:
+        await asyncio.wait_for(client.connect(), 10)
+        assert await firmware.state() == [0, 1, *([0] * 91)]
+        await client.reserve()
+        receipts = [
+            await client.upload_dynamic_pattern(slot, pixels)
+            for slot, pixels in enumerate(patterns, start=1)
+        ]
+        old_receipt = receipts[4]
+        patterns[4] = bytes(reversed(patterns[4]))
+        receipts[4] = await client.upload_dynamic_pattern(5, patterns[4])
+        assert receipts[4].generation == old_receipt.generation + 1
+        assert receipts[4].sha256 != old_receipt.sha256
+        firmware.drop["DPACK"] = 1
+
+        async def snap(index, pattern):
+            slot_index = index % len(receipts)
+            assert pattern == receipts[slot_index]
+            state = await firmware.state()
+            assert state[0] == index + 1
+            assert state[2:] == list(patterns[slot_index])
+            assert firmware.commands["DPACK"] == index + int(index > 0)
+            observed.append(index)
+            if fail_snap and index == 2:
+                raise RuntimeError("injected camera failure")
+
+        acquisition = client.dynamic_shots(receipts, 2, snap, ready=True)
+        if fail_snap:
+            with pytest.raises(RuntimeError, match="injected camera failure"):
+                await acquisition
+            assert observed == [0, 1, 2]
+            assert firmware.commands["DPACK"] == 3
+            assert owner.uncertain
+            assert await client.reservation_status.get_value(cached=False) == "held"
+        else:
+            await acquisition
+            assert observed == list(range(10))
+            assert firmware.commands["DPACK"] == 11
+            await client.release_reservation()
+            assert await client.reservation_status.get_value(cached=False) == "free"
+        assert firmware.commands["DPSTOP"] == 1
+        assert (await firmware.state())[2:] == [0] * 91
+    finally:
+        server.cancel()
+        await asyncio.gather(server, return_exceptions=True)

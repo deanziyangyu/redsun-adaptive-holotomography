@@ -9,15 +9,19 @@ import pytest
 import zarr
 from fastcs.transports.epics.pva.transport import EpicsPVATransport
 from mmcore_fakes import DATA_KEY, LABEL, FakeCameraCore, core_of
+from redsun.engine import RunEngine
 from redsun.path_provider import SessionPathProvider
 from redsun.services import serve_controller
 from test_unified_mcu import AutoShotFakePort
 
+from redsun_aht.device.esp300_stage import Esp300Stage
 from redsun_aht.device.mmcore.camera import MMCamera
 from redsun_aht.device.pva_automatic_stack import acquire_pva_automatic_stack
+from redsun_aht.device.pva_rotation import PvaRotationMotor
 from redsun_aht.device.pva_unified_mcu import PvaUnifiedMcu
 from redsun_aht.device.spinnaker_camera import SpinnakerCamera
 from redsun_aht.device.unified_mcu import AngularStack, UnifiedMcu
+from redsun_aht.presenter.holospim import HolospimPresenter
 from redsun_aht.services.mmcore_camera import MMCameraController
 from redsun_aht.services.spinnaker_camera import SpinnakerCameraController
 from redsun_aht.services.unified_mcu import UnifiedMcuController
@@ -110,11 +114,16 @@ async def test_automatic_continuous_full_stack(tmp_path, caplog, case):
         await asyncio.gather(*servers, return_exceptions=True)
 
 
-@pytest.mark.parametrize("extra", [False, True], ids=["complete", "extra"])
-async def test_spinnaker_service_supports_the_same_automatic_stack(tmp_path, extra):
+@pytest.mark.parametrize("case", ["complete", "extra", "presenter", "wrong-trigger"])
+async def test_spinnaker_service_supports_the_same_automatic_stack(tmp_path, case):
     class NativeCamera(FakeCameraCore):
         def __init__(self):
             super().__init__(pixel_type="16bit")
+
+        def isPropertyReadOnly(self, label, name):
+            return not name.startswith("Trigger") and super().isPropertyReadOnly(
+                label, name
+            )
 
         def isBufferOverflowed(self):
             return False
@@ -127,11 +136,17 @@ async def test_spinnaker_service_supports_the_same_automatic_stack(tmp_path, ext
             pass
 
     fake_camera = NativeCamera()
+    fake_camera.properties.update({
+        "TriggerMode": "Off" if case == "wrong-trigger" else "On",
+        "TriggerSelector": "FrameStart",
+        "TriggerSource": "Line0",
+        "TriggerActivation": "FallingEdge",
+    })
 
     class Port(AutoShotFakePort):
         async def write(self, data):
             if data.decode().startswith("SHOTAUTO "):
-                fake_camera.produce(49 if extra else 48)
+                fake_camera.produce({"presenter": 2, "extra": 49}.get(case, 48))
             return await super().write(data)
 
     port = Port()
@@ -157,6 +172,31 @@ async def test_spinnaker_service_supports_the_same_automatic_stack(tmp_path, ext
     owner = PvaUnifiedMcu(mp + ":", name="mcu")
     try:
         await asyncio.wait_for(asyncio.gather(camera.connect(), owner.connect()), 10)
+        if case in ("presenter", "wrong-trigger"):
+            presenter = HolospimPresenter(
+                "test", x28_bounds_tenths=(-36, 36), enable_x28_triggered_stack=True,
+            )
+            plan = presenter.x28_triggered_stack(
+                owner, camera, Esp300Stage("UNUSED:", name="survey"),
+                PvaRotationMotor("UNUSED:", name="rotation"),
+                0, 18, 2, "green", 5, confirm_setup=True,
+            )
+            events = []
+            future = RunEngine({})(plan, {"event": lambda _, doc: events.append(doc)})
+            if case == "wrong-trigger":
+                with pytest.raises(RuntimeError, match="TriggerMode=On"):
+                    await asyncio.wrap_future(future)
+                assert port.commands == ["identity", "00"]
+            else:
+                await asyncio.wait_for(asyncio.wrap_future(future), 20)
+                record = events[0]["data"]
+                assert record == {
+                    "attempted_pulses": 2, "stored_frames": 2,
+                    "camera_frame_count_delta": 2,
+                }
+                assert port.commands[-2:] == ["00", "c0"]
+                assert not owner.reservation_held
+            return
         await owner.reserve()
         call = acquire_pva_automatic_stack(
             owner,
@@ -172,7 +212,7 @@ async def test_spinnaker_service_supports_the_same_automatic_stack(tmp_path, ext
             illumination_ready=True,
             timeout_s=15,
         )
-        if extra:
+        if case == "extra":
             with pytest.raises(Exception, match=r"extra|count|overflow"):
                 await call
             return

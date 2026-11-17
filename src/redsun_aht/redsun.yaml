@@ -17,6 +17,7 @@ devices:
   mmcore-camera: redsun_aht.device.mmcore:MMCamera
   spinnaker-camera: redsun_aht.device.spinnaker_camera:SpinnakerCamera
   mmcore-stage: redsun_aht.device.mmcore:MMStage
+  esp300-stage: redsun_aht.device.esp300_stage:Esp300Stage
   arduino-led: redsun_aht.device.arduino.device:ArduinoLedDevice
   unified-rotation: redsun_aht.device.pva_rotation:PvaRotationMotor
   unified-mcu: redsun_aht.device.pva_unified_mcu:PvaUnifiedMcu
@@ -24,6 +25,7 @@ devices:
 presenters:
   detector: redsun_aht.presenter.detector:DetectorPresenter
   acquisition: redsun_aht.presenter.acquisition:AcquisitionPresenter
+  holospim: redsun_aht.presenter.holospim:HolospimPresenter
   dpct: redsun_aht.presenter.dpct:DpctPresenter
 
 views:
@@ -47,6 +49,9 @@ services:
   mmcore-stage:
     module: redsun_aht.services.mmcore_stage
     ready: mmcore stage ready
+  esp300-stage:
+    module: redsun_aht.services.esp300_stage
+    ready: ESP300 stage ready
   arduino-led:
     module: redsun_aht.services.arduino_led
     ready: arduino led ready

@@ -8,7 +8,7 @@ Ophyd-async clients expose those signals to Bluesky plans and presenters.
 
 | Selector | Devices |
 |---|---|
-| `holospim` | MMCore camera and survey stage, plus the ESP32-S3 MCU for X28 fast Z, LED illumination and rotation |
+| `holospim` | ESP300 survey XYZ, FLIR via Spinnaker, PVCAM via MMCore, plus the ESP32-S3 MCU for X28 fast Z, LED illumination and rotation |
 | `arh` | ASI LX4000 XYZ, FLIR via Spinnaker, Lumencor Spectra via MMCore, and Arduino Due via unified EMMSH |
 
 The [README](../README.md#run) shows how to check either profile in mock mode
@@ -88,6 +88,112 @@ axes, shutter behavior and trigger timing on each setup before use.
 Use the [Windows headless runner](../scripts/dsh/README.md) for pytest. The suite
 uses synthetic inputs, fake backends and loopback PVAccess. Keep GUI windows
 and physical devices out of headless checks.
+
+## HoloSPIM desktop session
+
+```mermaid
+flowchart LR
+    J["Positioner and foreground Xbox input"] --> P["Survey XYZ axes in micrometres"]
+    J --> X["Optional X28 axis and roll axis"]
+    A["Acquisition plans and device locks"] --> P
+    A --> M["Unified MCU client"]
+    A --> C["FLIR or PVCAM service over PVAccess"]
+    X --> M
+    P --> S["ESP300 service over PVAccess"] --> O["ESP300 serial owner"]
+    M --> U["Unified MCU service over PVAccess"] --> F["One ESP32-S3 serial owner"]
+    F --> H["X28, roll, LED panel and trigger outputs"]
+```
+
+The survey service requires the axis identities and configured travel bounds
+for all three axes. It issues sequential moves and uses controller encoder
+readback. An explicit stop latches the service until restart after
+reconciliation. RunEngine cleanup checks for an unresolved move on the
+touched axis before sending a stop, so completed acquisitions leave the
+survey stage available for the next bounded operation.
+
+The desktop routes survey XYZ, roll and the optional X28 axis through the
+Positioner. The
+`holospim_led_blank` acquisition action blanks the panel through the MCU
+service. The LED pattern preview displays files without sending commands.
+Acquisition device locks also disable the corresponding detector, positioner
+and ROI controls.
+
+HoloSPIM's survey stack, X28 stack, dynamic DPCT and hand-eye capture check
+that the selected camera reports both an idle service and internal trigger
+mode before starting acquisition.
+
+`holospim_survey_z_stack` captures internal-trigger frames at bounded ESP300
+Z positions and returns Z to its starting position after a successful run.
+Select the camera and confirm the optical setup before running. The plan
+records the ordered frame count and controller Z reading for each plane.
+
+For HoloSPIM roll motion, configure the MCU service's `roll-bounds-steps`
+with the commissioned lower and upper counter values. The service checks
+both the reported counter and the target. Re-zeroing changes the reference
+for those limits and is refused while they are configured.
+
+`holospim_x28_readback` records the controller-reported position, target,
+speed, position error and drive flags without commanding motion.
+
+The unified MCU service accepts X28 point-move requests only when the host
+configures `x28-jog-bounds-tenths` and requires HoloSPIM panel capabilities.
+The service checks its own bounds and refuses point moves during a reservation.
+It verifies zero reported speed, valid drive flags and target and position
+within one controller count for at least 150 ms before reporting settlement.
+The client can cancel a matching move by request ID. When motion may have
+started, cancellation requests a controller stop and quarantines the owner.
+Physical stop remains unverified. The endpoint takes controller tenths of a
+degree. The optional X28 Positioner row uses micrometres and requires both
+`x28_um_per_turn` and `x28_jog_bounds_tenths` on the MCU device. The signed
+scale sets the direction. Use the same angular bounds on the device and the
+service. When adding these settings in an overlay, repeat the MCU device's
+`plugin_name`, `plugin_id`, and `service` fields. The live profile check
+requires matching bounds and verifies that the configured range and maximum
+point move fit the 1 mm envelope at the supplied scale. Keep the row disabled
+on the instrument until the linear travel and stop checks are complete.
+
+In the foreground Positioner, hold A to jog. The left stick controls survey
+X/Y, and the vertical D-pad controls survey Z. The horizontal D-pad controls
+X28 when its row is configured. The right stick controls roll in mock
+sessions or when the live overlay sets `enable_controller_jog` on the
+rotation device and supplies the commissioned service `roll-bounds-steps`.
+Releasing A, disconnecting the controller, losing foreground focus, or
+locking a jog device for acquisition requests a stop for any unsettled jog.
+
+Set `presenters.holospim_ctrl.x28_bounds_tenths` in the host overlay to expose
+`holospim_x28_software_stack`. Limits and requested positions are in tenths
+of a degree at the X28 controller. Select a camera configured for internal
+trigger and confirm camera, illumination and travel readiness. The plan holds
+camera, survey and roll controls, disables MCU trigger pulses, and records a
+separate store per plane. A successful run leaves the LEDs blank, pulses
+disabled and X28 at the final plane.
+
+Set `presenters.holospim_ctrl.enable_x28_triggered_stack` to expose
+`holospim_x28_triggered_stack` with the configured X28 bounds. This plan
+requires FLIR FrameStart, Line0 and FallingEdge readbacks before enabling
+GPIO13 camera pulses. It writes one continuous capture and reconciles
+stored frames with the camera count and MCU pulse-attempt count.
+Frame-to-plane association follows host order. A successful run blanks
+illumination, disables automatic pulses and leaves X28 at the last plane.
+
+The `holospim_dynamic_dpct` plan is available when
+`presenters.holospim_ctrl.enable_dynamic_dpct` is enabled. Supply a JSON file
+containing one to five arrays of 91 integer weights from 0 to 255, in panel
+index order. The camera must be configured for internal trigger. The run
+saves a frame store and recipe hashes. Each frame event records the
+zero-based store index, camera service count, slot, generation and CRC.
+The run marks the association as inferred from host snap order.
+
+The `holospim_hand_eye_preview` action exports a signed XYZ/roll path for
+simulator review. Zero omits an axis. Set `hand_eye_roll_limits_deg` in the
+presenter configuration to include roll and enter the parked X28 simulator
+coordinate in millimetres. The action reads the current anchor without
+moving the devices or taking frames.
+
+`holospim_hand_eye_capture` takes the preview and its sampled simulator
+review. After operator confirmation it checks the current anchor and limits,
+captures the designated waypoints and records before/after positions in the
+camera store. The roll reading is the controller's step counter.
 
 ## ARH desktop session
 

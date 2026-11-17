@@ -40,7 +40,7 @@ class _PointRecord:
     name = "timelapse_frame"
 
     def __init__(self) -> None:
-        self.values: dict[str, int] = {}
+        self.values: dict[str, int | float | str] = {}
 
     def read(self) -> dict[str, dict[str, Any]]:
         timestamp = time.time()
@@ -55,10 +55,16 @@ class _PointRecord:
                 "source": "PLAN:host_clock"
                 if key.endswith("_ns")
                 else "PLAN:requested",
-                "dtype": "integer",
+                "dtype": (
+                    "string"
+                    if isinstance(value, str)
+                    else "number"
+                    if isinstance(value, float)
+                    else "integer"
+                ),
                 "shape": [],
             }
-            for key in self.values
+            for key, value in self.values.items()
         }
 
 

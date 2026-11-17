@@ -23,6 +23,7 @@ class FakePort:
         self.wrong_config = wrong_config
         self.repeat = repeat
         self.auto = True
+        self.x_position = 0
 
     def emit(self, line):
         self.responses.put_nowait((line + "\n").encode())
@@ -51,6 +52,8 @@ class FakePort:
         elif cmd == "zasyncxstate":
             b = bytearray(37)
             b[0:4] = bytes([1, 0x43, 37, 12])
+            b[14] = b[22] = int(self.x_position < 0)
+            b[15:19] = b[23:27] = abs(self.x_position).to_bytes(4, "big")
             b[34:36] = bytes([3, 3])
             b[36] = 0x6B
             self.emit("ZA pending")
@@ -870,3 +873,43 @@ async def test_automatic_camera_prestart_failure_never_sends_start():
     assert not any(c.startswith("SHOTAUTO ") for c in port.commands)
     assert any(c.startswith("SHOTABORT ") for c in port.commands)
     assert owner.uncertain
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("readback", [17, 18, 37])
+async def test_bounded_x28_point_move_requires_settled_readback(readback):
+    class PointMovePort(FakePort):
+        async def write(self, data):
+            if data == b"zabs 18\n":
+                self.commands.append("zabs 18")
+                self.x_position = readback
+                self.emit("Z result=0")
+                return len(data)
+            return await super().write(data)
+
+    port = PointMovePort()
+    mcu = UnifiedMcu(port)
+    await mcu.identify()
+    if readback in (17, 18):
+        state = await mcu.move_x_absolute(18, lower=-36, upper=36)
+        assert state.position_tenths == state.target_tenths == readback
+        assert "zstop" not in port.commands
+    else:
+        with pytest.raises(UnifiedMcuError, match="outside bounds"):
+            await mcu.move_x_absolute(18, lower=-36, upper=36)
+        assert port.commands[-1] == "zstop"
+        assert mcu.uncertain
+    assert port.commands[1:5] == [
+        "zasyncxconfig", "zasyncxstate", "zabs 18", "zasyncxstate",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_bounded_x28_refuses_out_of_range_start_before_command():
+    port = FakePort()
+    port.x_position = -37
+    mcu = UnifiedMcu(port)
+    await mcu.identify()
+    with pytest.raises(UnifiedMcuError, match="outside bounds"):
+        await mcu.move_x_absolute(18, lower=-36, upper=36)
+    assert port.commands == ["identity", "zasyncxconfig", "zasyncxstate"]

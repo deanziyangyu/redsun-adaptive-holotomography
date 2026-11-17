@@ -77,6 +77,13 @@ class XControllerState:
     raw_hex: str
     quality: str = "controller_reported"
 
+    def matches_point_target(self, requested_tenths: int) -> bool:
+        """Allow one controller count for reported target and actual position."""
+        return (
+            abs(self.position_tenths - requested_tenths) <= 1
+            and abs(self.target_tenths - requested_tenths) <= 1
+        )
+
 
 def parse_x_state(frame: bytes) -> XControllerState:
     """Validate and decode the X-family aggregate state reply."""
@@ -381,6 +388,89 @@ class UnifiedMcu:
                 self._uncertain = True
                 raise
 
+    async def move_x_absolute(
+        self, target: int, *, lower: int, upper: int
+    ) -> XControllerState:
+        """Move X within a commissioned window in controller tenths of a degree."""
+        if (
+            any(type(value) is not int for value in (target, lower, upper))
+            or not -3600 <= lower <= target <= upper <= 3600
+            or lower >= upper
+        ):
+            raise ValueError("invalid bounded X28 target")
+        self._admit()
+        async with self._operation:
+            move_attempted = False
+            try:
+                config = await self._preflight(
+                    "zasyncxconfig", "ZA config_hex=", 0x42, 24
+                )
+                if (config[24], config[25], config[26]) != (0, 1, 0):
+                    raise UnifiedMcuError("unsupported controller configuration")
+                start = await self._read_bounded_x_state(lower, upper)
+                if not self._x_stationary(start):
+                    raise UnifiedMcuError("controller not stationary and ready")
+                if abs(start.position_tenths - target) > 3600:
+                    raise UnifiedMcuError("X28 move exceeds one revolution")
+                if start.position_tenths == start.target_tenths == target:
+                    return start
+                move_attempted = True
+                acknowledged = False
+                last_state = None
+                try:
+                    async with asyncio.timeout(5):
+                        await self._exchange(f"zabs {target}", "Z result=0")
+                        acknowledged = True
+                        stationary_since = None
+                        while True:
+                            last_state = await self._read_bounded_x_state(lower, upper)
+                            if (
+                                self._x_stationary(last_state)
+                                and last_state.matches_point_target(target)
+                            ):
+                                now = asyncio.get_running_loop().time()
+                                if stationary_since is None:
+                                    stationary_since = now
+                                elif now - stationary_since >= 0.15:
+                                    return last_state
+                            else:
+                                stationary_since = None
+                            await asyncio.sleep(0.025)
+                except TimeoutError as error:
+                    raise TimeoutError(
+                        f"X28 target {target}: timed out "
+                        f"(acknowledged={acknowledged}, last state={last_state!r})"
+                    ) from error
+            except BaseException:
+                self._uncertain = True
+                if move_attempted:
+                    try:
+                        await asyncio.wait_for(self._write("zstop"), timeout=1)
+                    except Exception:
+                        logger.exception("X28 stop request failed")
+                raise
+
+    async def _read_bounded_x_state(self, lower: int, upper: int) -> XControllerState:
+        state = parse_x_state(
+            await self._preflight("zasyncxstate", "ZA state_hex=", 0x43, 12)
+        )
+        if (
+            state.home_flags & 3 != 3
+            or state.home_flags & 0x3C
+            or not state.motor_flags & 1
+            or state.motor_flags & 0x8C
+            or not lower <= state.position_tenths <= upper
+            or not lower <= state.target_tenths <= upper
+        ):
+            raise UnifiedMcuError("controller fault or position outside bounds")
+        return state
+
+    @staticmethod
+    def _x_stationary(state: XControllerState) -> bool:
+        return bool(state.motor_flags & 2) and (
+            state.speed_tenths_rpm == 0 and abs(state.error_hundredths_degree) <= 10
+        )
+
     async def rotation_command(
         self, action: str, steps: int | None = None
     ) -> RotationState:
@@ -419,7 +509,9 @@ class UnifiedMcu:
                 self._uncertain = True
                 raise
 
-    async def identify(self, *, due: bool = False) -> None:
+    async def identify(
+        self, *, due: bool = False, require_holospim_panel: bool = False
+    ) -> None:
         """Require the selected firmware identity before any operation."""
         if self._operation.locked() or self._uncertain:
             raise UnifiedMcuError("unified MCU busy or uncertain")
@@ -429,6 +521,21 @@ class UnifiedMcu:
                 identity = await self._line()
                 if identity != (DUE_IDENTITY if due else IDENTITY):
                     raise UnifiedMcuError(f"unexpected firmware identity: {identity!r}")
+                if require_holospim_panel:
+                    await self._write("IP?")
+                    panel = await self._line()
+                    match = re.fullmatch(
+                        r"IP protocol=1 pixels=91 ids=6-13 loaded=([0-9]{1,3})", panel
+                    )
+                    if match is None or int(match[1]) > 255:
+                        raise UnifiedMcuError(
+                            f"unexpected HoloSPIM firmware capabilities: {panel!r}"
+                        )
+                    pixels, _ = await self._dynamic.capabilities()
+                    if pixels != 91:
+                        raise UnifiedMcuError(
+                            f"HoloSPIM dynamic pattern protocol reports {pixels} pixels"
+                        )
                 self._identified = True
             except BaseException:
                 self._uncertain = True

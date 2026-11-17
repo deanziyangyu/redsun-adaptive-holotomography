@@ -25,7 +25,13 @@ class PvaXState(Device):
         """Request once and validate correlation, raw bytes and decoded fields."""
         request_id = uuid4().hex
         await self.x_state_request.set(request_id)
-        response = json.loads(await self.x_state_result.get_value(cached=False))
+        return self._decode_state(
+            await self.x_state_result.get_value(cached=False), request_id
+        )
+
+    @staticmethod
+    def _decode_state(payload: str, request_id: str) -> XControllerState:
+        response = json.loads(payload)
         if (
             not isinstance(response, dict)
             or set(response) != {"request_id", "state"}

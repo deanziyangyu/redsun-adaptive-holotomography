@@ -7,23 +7,33 @@ client does not implement camera arming, durable leases, recovery or a safety st
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
+import zlib
 from dataclasses import asdict
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
-from ophyd_async.core import Device, SignalR, SignalW, wait_for_value
-from ophyd_async.fastcs.core import fastcs_connector
+from ophyd_async.core import DEFAULT_TIMEOUT, SignalR, SignalW, wait_for_value
 
+from redsun_aht.device.dynamic_patterns import DynamicPattern
+from redsun_aht.device.pva_x_state import PvaXState
 from redsun_aht.device.unified_mcu import (
     AngularStack,
     AutomaticShotSummary,
     RotationState,
     StackProgress,
+    XControllerState,
 )
+from redsun_aht.device.x28_axis import X28Axis
 
 logger = logging.getLogger(__name__)
+
+if TYPE_CHECKING:
+    from collections.abc import Awaitable, Callable, Iterable, Sequence
+
+    from ophyd_async.core import DeviceMock
 
 
 def parse_progress(value: str, stack: AngularStack) -> StackProgress:
@@ -54,10 +64,13 @@ def parse_progress(value: str, stack: AngularStack) -> StackProgress:
     return StackProgress(stack.run_id, tuple(targets), complete)
 
 
-class PvaUnifiedMcu(Device):
+class PvaUnifiedMcu(PvaXState):
     """Sequential transaction client; uncertain outcomes prevent reuse."""
 
     request: SignalW[str]
+    dynamic_pattern_request: SignalW[str]
+    dynamic_pattern_result: SignalR[str]
+    dynamic_shot_request: SignalW[str]
     shot_request: SignalW[str]
     automatic_request: SignalW[str]
     automatic_result: SignalR[str]
@@ -77,9 +90,16 @@ class PvaUnifiedMcu(Device):
     reservation_status: SignalR[str]
     rotation_request: SignalW[str]
     rotation_result: SignalR[str]
+    x_move_request: SignalW[str]
+    x_move_result: SignalR[str]
+    x_move_cancel: SignalW[str]
 
-    def __init__(self, prefix: str, *, name: str = "") -> None:
-        super().__init__(name=name, connector=fastcs_connector(prefix, self))
+    def __init__(
+        self, prefix: str, *, name: str = "",
+        x28_um_per_turn: float | None = None,
+        x28_jog_bounds_tenths: tuple[int, int] | None = None,
+    ) -> None:
+        super().__init__(prefix, name=name)
         self._last_allocated_id = 0
         self._active = False
         self._uncertain = False
@@ -87,16 +107,79 @@ class PvaUnifiedMcu(Device):
         self._reserving = False
         self._reservation_generation = 0
         self._rotation_lock = asyncio.Lock()
+        self._x_move_id: str | None = None
+        if x28_um_per_turn is not None and x28_jog_bounds_tenths is not None:
+            self.x28 = X28Axis(self, x28_um_per_turn, x28_jog_bounds_tenths)
+        elif x28_um_per_turn is not None or x28_jog_bounds_tenths is not None:
+            raise ValueError("X28 Positioner requires both scale and bounds")
+
+    async def connect(
+        self, mock: bool | DeviceMock[Any] = False, timeout: float = DEFAULT_TIMEOUT,
+        force_reconnect: bool = False,
+    ) -> None:
+        """Use local X28 travel when the session uses mock devices."""
+        if hasattr(self, "x28"):
+            self.x28._simulated = bool(mock)
+        await super().connect(mock, timeout, force_reconnect)
 
     @property
     def reservation_generation(self) -> int:
         """Local generation that changes after each successful reservation."""
         return self._reservation_generation
 
+    async def read_state(self) -> XControllerState:
+        """Read the X28 aggregate state through this client's MCU owner."""
+        if self._active or self._reserving or self._uncertain:
+            raise RuntimeError("client busy or uncertain")
+        self._active = True
+        try:
+            return await super().read_state()
+        finally:
+            self._active = False
+
     async def rotation(self, action: str, steps: int | None = None) -> RotationState:
         """Command or query rotation through the same cooperative MCU owner."""
         async with self._rotation_lock:
             return await self._rotation_transaction(action, steps)
+
+    async def move_x_absolute(self, target: int) -> XControllerState:
+        """Request one point move within the MCU service's configured bounds."""
+        if type(target) is not int or not -3600 <= target <= 3600:
+            raise ValueError("invalid X28 target")
+        if self._active or self._reserving or self._uncertain or self.reservation_held:
+            raise RuntimeError("client busy, reserved or uncertain")
+        self._active = True
+        request_id = uuid4().hex
+        self._x_move_id = request_id
+        try:
+            await self.x_move_request.set(
+                json.dumps({"request_id": request_id, "target": target}), timeout=15
+            )
+            state = self._decode_state(
+                await self.x_move_result.get_value(cached=False), request_id
+            )
+            if not state.matches_point_target(target):
+                raise ValueError("X28 point move result disagrees with target")
+            return state
+        except (asyncio.CancelledError, TimeoutError):
+            self._uncertain = True
+            try:
+                await asyncio.shield(self.x_move_cancel.set(request_id, timeout=3))
+            except Exception:
+                logger.exception("X28 cancellation request failed; stop unverified")
+            raise
+        except BaseException:
+            self._uncertain = True
+            raise
+        finally:
+            self._x_move_id = None
+            self._active = False
+
+    async def stop_x_move(self) -> None:
+        """Request cancellation of this client's active point move."""
+        request_id = self._x_move_id
+        if request_id is not None:
+            await self.x_move_cancel.set(request_id, timeout=3)
 
     async def _rotation_transaction(
         self, action: str, steps: int | None
@@ -202,6 +285,51 @@ class PvaUnifiedMcu(Device):
         self._last_allocated_id = last
         return tuple(range(first, last + 1))
 
+    async def upload_dynamic_pattern(self, slot: int, pixels: bytes) -> DynamicPattern:
+        """Publish a 91-pixel map through the reserved MCU serial owner."""
+        if type(slot) is not int or not 1 <= slot <= 5 or not isinstance(pixels, bytes):
+            raise ValueError("expected a slot in 1..5 and immutable pixel bytes")
+        if len(pixels) != 91:
+            raise ValueError("expected 91 intensity bytes")
+        if not self.reservation_held or self._active:
+            raise RuntimeError("an idle reserved MCU client is required")
+        self._active = True
+        request_id = uuid4().hex
+        crc, digest = zlib.crc32(pixels), hashlib.sha256(pixels).hexdigest()
+        try:
+            await self.dynamic_pattern_request.set(
+                json.dumps(
+                    {
+                        "id": request_id,
+                        "token": self._reservation_token,
+                        "slot": slot,
+                        "pixels": pixels.hex(),
+                    }
+                )
+            )
+            result = json.loads(
+                await self.dynamic_pattern_result.get_value(cached=False)
+            )
+            if (
+                not isinstance(result, dict)
+                or set(result) != {"id", "slot", "generation", "crc32", "sha256"}
+                or result["id"] != request_id
+                or type(result["slot"]) is not int
+                or result["slot"] != slot
+                or type(result["generation"]) is not int
+                or not 1 <= result["generation"] <= 0xFFFFFFFF
+                or type(result["crc32"]) is not int
+                or result["crc32"] != crc
+                or result["sha256"] != digest
+            ):
+                raise ValueError("dynamic map receipt mismatch")
+            return DynamicPattern(slot, result["generation"], crc, digest)
+        except BaseException:
+            self._uncertain = True
+            raise
+        finally:
+            self._active = False
+
     async def set_reserved_illumination(self, command: str) -> None:
         """Send an LED command while retaining the cooperative reservation."""
         if not isinstance(command, str):
@@ -289,27 +417,113 @@ class PvaUnifiedMcu(Device):
             "bind_stage": bind_stage,
             "hold_illumination": hold_illumination,
         }
+
+        def expected_frames() -> Iterable[dict[str, int | str]]:
+            for index, pattern in enumerate(patterns):
+                plane = index // shots_per_plane
+                yield {
+                    "run_id": definition.run_id,
+                    "shot": index,
+                    "plane": plane,
+                    "pattern": pattern,
+                    "target_tenths": definition.first + definition.step * plane,
+                }
+
+        async def capture(index: int) -> None:
+            plane = index // shots_per_plane
+            await snap(
+                index,
+                plane,
+                patterns[index],
+                definition.first + definition.step * plane,
+            )
+
+        await self._confirmed_shots(
+            self.shot_request,
+            payload,
+            token,
+            definition.run_id,
+            expected_frames(),
+            capture,
+            snap_timeout_s,
+        )
+
+    async def dynamic_shots(
+        self,
+        patterns: Sequence[DynamicPattern],
+        repeats: int,
+        snap: Callable[[int, DynamicPattern], Awaitable[None]],
+        *,
+        ready: bool,
+    ) -> None:
+        """Confirm each dynamic pattern only when the caller's snap completes."""
+        patterns = tuple(patterns)
+        if (
+            not 1 <= len(patterns) <= 64
+            or type(repeats) is not int
+            or not 1 <= repeats <= 32
+        ):
+            raise ValueError("expected 1..64 dynamic steps and 1..32 repeats")
+        if ready is not True:
+            raise ValueError("exclusive camera and illumination readiness required")
+        (run_id,) = await self.allocate_run_ids(1)
+        token = self._reservation_token
+        assert token is not None
+        payload = {
+            "token": token,
+            "run_id": run_id,
+            "patterns": [asdict(p) for p in patterns],
+            "repeats": repeats,
+            "ready": True,
+        }
+        recipe = patterns * repeats
+
+        async def capture(index: int) -> None:
+            await snap(index, recipe[index])
+
+        await self._confirmed_shots(
+            self.dynamic_shot_request,
+            payload,
+            token,
+            run_id,
+            (
+                {
+                    "run_id": run_id,
+                    "shot": index,
+                    "mode": "dynamic",
+                    "slot": pattern.slot,
+                    "generation": pattern.generation,
+                }
+                for index, pattern in enumerate(recipe)
+            ),
+            capture,
+            15.0,
+        )
+
+    async def _confirmed_shots(
+        self,
+        request: SignalW[str],
+        payload: dict[str, Any],
+        token: str,
+        run_id: int,
+        frames: Iterable[dict[str, int | str]],
+        capture: Callable[[int], Awaitable[None]],
+        snap_timeout_s: float,
+    ) -> None:
         self._active = True
         request_task: asyncio.Task[None] | None = None
         waiter: asyncio.Task[None] | None = None
         try:
 
             async def submit() -> None:
-                await self.shot_request.set(json.dumps(payload))
+                await request.set(json.dumps(payload))
 
             request_task = asyncio.create_task(submit())
-            for index, pattern in enumerate(patterns):
-                plane = index // shots_per_plane
-                target = definition.first + definition.step * plane
-                expected = {
-                    "run_id": definition.run_id,
-                    "shot": index,
-                    "plane": plane,
-                    "pattern": pattern,
-                    "target_tenths": target,
-                }
+            for index, expected in enumerate(frames):
 
-                def matches(raw: str, expected: dict[str, int] = expected) -> bool:
+                def matches(
+                    raw: str, expected: dict[str, int | str] = expected
+                ) -> bool:
                     try:
                         return json.loads(raw) == expected
                     except (TypeError, ValueError):
@@ -327,13 +541,9 @@ class PvaUnifiedMcu(Device):
                     request_task.result()
                     raise RuntimeError("shot request ended before readiness")
                 await waiter
-                await asyncio.wait_for(
-                    snap(index, plane, pattern, target), snap_timeout_s
-                )
+                await asyncio.wait_for(capture(index), snap_timeout_s)
                 await self.shot_confirm.set(
-                    json.dumps(
-                        {"token": token, "run_id": definition.run_id, "shot": index}
-                    )
+                    json.dumps({"token": token, "run_id": run_id, "shot": index})
                 )
             await request_task
         except BaseException:
@@ -345,7 +555,7 @@ class PvaUnifiedMcu(Device):
                 await asyncio.shield(
                     asyncio.wait_for(
                         self.shot_cancel.set(
-                            json.dumps({"token": token, "run_id": definition.run_id})
+                            json.dumps({"token": token, "run_id": run_id})
                         ),
                         2,
                     )

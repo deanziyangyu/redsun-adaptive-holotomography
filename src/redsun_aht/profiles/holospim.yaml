@@ -7,20 +7,30 @@ services:
   transport: pv-access
   survey_service:
     plugin_name: redsun-aht
-    plugin_id: mmcore-stage
+    plugin_id: esp300-stage
     prefix: "HOLOSPIM-SURVEY:"
     args:
-      adapter: "REPLACE_STAGE_ADAPTER"
-      device: "REPLACE_STAGE_DEVICE"
-      axes: "x,y,z"
+      port: "REPLACE_ESP300_SERIAL_PORT"
+      prefix: "HOLOSPIM-SURVEY:"
+      axis-identities: ["REPLACE_ESP300_X_ID", "REPLACE_ESP300_Y_ID", "REPLACE_ESP300_Z_ID"]
       limits: "REPLACE_SURVEY_LIMITS_UM"
   camera_service:
     plugin_name: redsun-aht
-    plugin_id: mmcore-camera
+    plugin_id: spinnaker-camera
     prefix: "HOLOSPIM-CAMERA:"
     args:
-      adapter: "REPLACE_CAMERA_ADAPTER"
-      device: "REPLACE_CAMERA_DEVICE"
+      serial: "REPLACE_FLIR_SERIAL"
+      pixel-format: "REPLACE_FLIR_PIXEL_FORMAT"
+      name: camera
+  pvcam_service:
+    plugin_name: redsun-aht
+    plugin_id: mmcore-camera
+    prefix: "HOLOSPIM-PVCAM:"
+    args:
+      mm-config: "REPLACE_PVCAM_MM_CONFIG"
+      device: "REPLACE_PVCAM_CAMERA_LABEL"
+      defer-initial-frame: true
+      name: pvcam
   mcu_service:
     plugin_name: redsun-aht
     plugin_id: unified-mcu
@@ -31,12 +41,16 @@ services:
 devices:
   survey:
     plugin_name: redsun-aht
-    plugin_id: mmcore-stage
+    plugin_id: esp300-stage
     service: survey_service
   camera:
     plugin_name: redsun-aht
-    plugin_id: mmcore-camera
+    plugin_id: spinnaker-camera
     service: camera_service
+  pvcam:
+    plugin_name: redsun-aht
+    plugin_id: mmcore-camera
+    service: pvcam_service
   rotation:
     plugin_name: redsun-aht
     plugin_id: unified-rotation
