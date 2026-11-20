@@ -10,11 +10,14 @@ Instrument profiles select the devices and services for each setup.
 
 | Selector | Packaged profile | Device stack |
 |---|---|---|
-| `holospim` | [holospim.yaml](src/redsun_aht/profiles/holospim.yaml) | ESP300 survey XYZ, FLIR via Spinnaker, PVCAM via MMCore, plus ESP32-S3 MCU for X28 fast Z, LED and rotation |
+| `holospim` | [holospim.yaml](src/redsun_aht/profiles/holospim.yaml) | ESP300 survey XYZ, FLIR via Spinnaker, PVCAM via MMCore, AAAOTF laser shutter, and ESP32-S3 MCU for X28 fast Z, LED and rotation |
 | `arh` | [arh_system.yaml](src/redsun_aht/profiles/arh_system.yaml) | ASI LX4000 XYZ, FLIR via Spinnaker, Lumencor Spectra via MMCore, and Arduino Due MCU |
 
 Both profiles use the same AHT installation. Keep host-specific settings in
 an overlay on each instrument machine.
+
+The HoloSPIM laser attaches to a separately supervised service. See the
+[AAAOTF service instructions](docs/aaaotf.md) for startup and profile commands.
 
 ## Status
 

@@ -5,6 +5,9 @@ strict: true
 mock: true
 services:
   transport: pv-access
+  laser_service:
+    prefix: "HOLOSPIM-AAAOTF:"
+    address: "127.0.0.1"
   survey_service:
     plugin_name: redsun-aht
     plugin_id: esp300-stage
@@ -39,6 +42,10 @@ services:
       port: "REPLACE_MCU_SERIAL_PORT"
       prefix: "HOLOSPIM-MCU:"
 devices:
+  laser:
+    plugin_name: redsun-aht
+    plugin_id: aaaotf
+    service: laser_service
   survey:
     plugin_name: redsun-aht
     plugin_id: esp300-stage

@@ -173,6 +173,7 @@ def test_packaged_device_profiles_build_and_shutdown_mock(profile, tmp_path):
                 "pvcam",
                 "rotation",
                 "mcu",
+                "laser",
             } == session.devices.keys()
     finally:
         session.shutdown()
@@ -242,13 +243,40 @@ def test_holospim_operator_plan_targets_only_the_profile_mcu(tmp_path):
         assert survey_reading.quality == "simulated"
         assert {axis.name: axis.value for axis in survey_reading.axes}["z"] == 5.0
         assert "holospim_hand_eye_preview" in session.acq_ctrl.plans
+        laser_spec = session.acq_ctrl.plans["holospim_laser_profile"]
+        laser_parameters = {
+            parameter.name: parameter for parameter in laser_spec.parameters
+        }
+        assert laser_parameters["profile"].choices == ["All Off", "488 nm", "561 nm"]
+        assert laser_parameters["profile"].default == "All Off"
+        assert laser_parameters["laser"].choices == ["laser"]
+        laser = session.devices["laser"]
+        engine = RedsunRunEngine({})
+        for preset in laser_parameters["profile"].choices:
+            engine(session.holospim_ctrl.laser_profile(laser, preset)).result(10)
+        commands = [
+            json.loads(call.args[0])
+            for call in get_mock_put(laser.writer_command).await_args_list
+        ]
+        assert [
+            command.get("properties", command.get("profile"))
+            for command in commands
+            if command["action"] in ("profile", "properties")
+        ] == [
+            "all_off",
+            "all_off",
+            {"Channel": 1, "Frequency (MHz)": 112.28, "Maximum intensity (dB)": 1750,
+             "Power (% of max)": 100, "State": 1},
+            "all_off",
+            {"Channel": 1, "Frequency (MHz)": 92.63, "Maximum intensity (dB)": 1900,
+             "Power (% of max)": 100, "State": 1},
+        ]
         starts = []
         rotation = session.devices["rotation"]
         camera = session.devices["camera"]
         preview = session.holospim_ctrl.hand_eye_preview(
             camera, survey, rotation, parked_x28_mm=0.25, x_step_um=10, roll_step_deg=2
         )
-        engine = RedsunRunEngine({})
         engine(preview, {"start": lambda _, document: starts.append(document)}).result(
             10
         )

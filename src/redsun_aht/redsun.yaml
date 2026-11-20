@@ -13,6 +13,7 @@ devices:
   asi-filter-wheel: redsun_aht.robotic.device.asi._service:AsiFilterWheel
   asi-lx4000: redsun_aht.robotic.device.asi._service:AsiSerialStage
   lumencor-spectra: redsun_aht.robotic.device.auxiliary:LumencorSpectra
+  aaaotf: redsun_aht.device.aaaotf:AttachedAAAOTF
   unified-emmsh: redsun_aht.robotic.device.auxiliary:UnifiedEmmsh
   mmcore-camera: redsun_aht.device.mmcore:MMCamera
   spinnaker-camera: redsun_aht.device.spinnaker_camera:SpinnakerCamera
@@ -67,3 +68,5 @@ services:
   unified-mcu:
     module: redsun_aht.services.unified_mcu
     ready: unified MCU ready
+  aaaotf:
+    module: redsun_aht.services.aaaotf

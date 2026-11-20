@@ -15,6 +15,13 @@ The [README](../README.md#run) shows how to check either profile in mock mode
 and layer in host settings. Both profiles build headless device sessions.
 The camera and DPCT GUI sessions have separate entry points.
 
+The HoloSPIM Hardware dock binds the profile's attached AAAOTF device to
+laser presets, an All Off action and RF settings. Service readbacks populate
+the status display. Button requests follow
+`Hardware → AcquisitionPresenter → RunEngine → AttachedAAAOTF → persistent PVA service`.
+The service retains ownership of its MMCore connection. See the
+[AAAOTF setup and controls](aaaotf.md).
+
 ## LED pattern preview
 
 The ARH and HoloSPIM desktops include a Matplotlib LED Pattern Preview dock.
@@ -97,6 +104,7 @@ flowchart LR
     J --> X["Optional X28 axis and roll axis"]
     A["Acquisition plans and device locks"] --> P
     A --> M["Unified MCU client"]
+    A --> L["AAAOTF laser client"] --> LP["Persistent FastCS/PVA service"] --> LA["PyMMCore AAAOTF owner"]
     A --> C["FLIR or PVCAM service over PVAccess"]
     X --> M
     P --> S["ESP300 service over PVAccess"] --> O["ESP300 serial owner"]
@@ -115,6 +123,9 @@ The desktop routes survey XYZ, roll and the optional X28 axis through the
 Positioner. The
 `holospim_led_blank` acquisition action blanks the panel through the MCU
 service. The LED pattern preview displays files without sending commands.
+The `holospim_laser_profile` action offers **All Off**, **488 nm**, and
+**561 nm** through the attached AAAOTF service. See the
+[laser service instructions](aaaotf.md).
 Acquisition device locks also disable the corresponding detector, positioner
 and ROI controls.
 

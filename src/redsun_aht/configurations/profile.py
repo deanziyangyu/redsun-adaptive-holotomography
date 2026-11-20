@@ -179,6 +179,20 @@ def read_arh_profile(path: Path) -> dict:
     return read_instrument_profile(path)
 
 
+def read_holospim_profile(path: Path) -> dict:
+    """Load a full HoloSPIM profile with the packaged laser as its default."""
+    config = read_instrument_profile(path)
+    devices = config.setdefault("devices", {})
+    if "laser" not in devices:
+        packaged = Path(__file__).resolve().parents[1] / "profiles" / "holospim.yaml"
+        default = read_instrument_profile(packaged)
+        services = config.setdefault("services", {})
+        services.setdefault("transport", "pv-access")
+        services.setdefault("laser_service", default["services"]["laser_service"])
+        devices["laser"] = default["devices"]["laser"]
+    return config
+
+
 def without_arh_due(config: dict) -> dict:
     """Omit Due services and their client devices from an ARH profile."""
     services = config.get("services", {})
@@ -235,7 +249,14 @@ def run_profile(argv: Sequence[str]) -> int:
         profile = ARH_WORKSPACE_PROFILE
     base = profile or profiles / filename
     try:
-        layers = [read_instrument_profile(path) for path in (base, *options.overlay)]
+        read_base = (
+            read_holospim_profile if options.instrument == "holospim"
+            else read_arh_profile
+        )
+        layers = [
+            read_base(base),
+            *(read_instrument_profile(path) for path in options.overlay),
+        ]
     except (OSError, ValueError) as error:
         parser.error(str(error))
     if options.check:

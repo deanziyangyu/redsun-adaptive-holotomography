@@ -101,6 +101,13 @@ def _serve_lumencor(argv: Sequence[str]) -> int:
     return main(list(argv))
 
 
+def _serve_aaaotf(argv: Sequence[str]) -> int:
+    """Serve the persistent HoloSPIM laser shutter over PVAccess."""
+    from ..services.aaaotf import main
+
+    return main(list(argv))
+
+
 def _serve_emmsh(argv: Sequence[str]) -> int:
     """Serve the Due EMMSH controller."""
     from ..robotic.services.unified_emmsh import main
@@ -160,6 +167,7 @@ _SERVICES: Mapping[str, Entry] = {
     "arduino-led": _serve_arduino_led,
     "asi-lx4000": _serve_lx4000,
     "lumencor-spectra": _serve_lumencor,
+    "aaaotf": _serve_aaaotf,
     "unified-emmsh": _serve_emmsh,
     "unified-mcu": _serve_unified_mcu,
 }

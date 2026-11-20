@@ -7,10 +7,12 @@ from typing import Annotated, ClassVar, NoReturn
 
 from qtpy import QtCore, QtWidgets
 from redsun import AsHook, AsPresenter, AsView, Link, Serves, links_between, slot
+from redsun.aio import run_coro
 from redsun.presenter import PositionerPresenter
 from redsun.qt import QtHook, QtSession
 from redsun.view.qt.builtins import PositionerView
 
+from ..device.aaaotf import AttachedAAAOTF
 from ..device.esp300_stage import Esp300Stage
 from ..device.pva_rotation import PvaRotationMotor
 from ..hooks import NapariApplication
@@ -22,9 +24,10 @@ from ..presenter.holospim import HolospimPresenter
 from ..presenter.led_patterns import LedPatternPresenter
 from ..view.acquisition import AcquisitionView
 from ..view.detector import DetectorView
+from ..view.holospim import HolospimControls
 from ..view.image import ImageView
 from ..view.led_patterns import LedPatternView
-from .profile import check_holospim_host, read_instrument_profile
+from .profile import check_holospim_host, read_holospim_profile, read_instrument_profile
 from .wiring import (
     DetectorPreview,
     DetectorPreviewSource,
@@ -134,6 +137,7 @@ class HolospimSession(QtSession):
             "img_widget": {},
             "positioner_widget": {},
             "led_pattern_widget": {},
+            "hardware_widget": {},
         },
     }
 
@@ -148,6 +152,7 @@ class HolospimSession(QtSession):
     img_widget: AsView[ImageView]
     positioner_widget: AsView[HolospimPositionerView]
     led_pattern_widget: AsView[LedPatternView]
+    hardware_widget: AsView[HolospimControls]
     preview: DetectorPreview
 
     def wire(self) -> Iterator[Link]:
@@ -183,11 +188,44 @@ class HolospimSession(QtSession):
         if targets:
             self.positioner_widget.configure_jog(targets)
         yield from wire_led_patterns(self.led_pattern_ctrl, self.led_pattern_widget)
+        lasers = [
+            name for name, device in self.devices.items()
+            if isinstance(device, AttachedAAAOTF)
+        ]
+        self._laser_name = lasers[0] if len(lasers) == 1 else None
+        self.hardware_widget.set_device(self._laser_name)
+        if self._laser_name is not None:
+            laser = self.devices[self._laser_name]
+            try:
+                reading = run_coro(laser.status.read(), timeout=2)
+            except Exception:
+                reading = {}
+            self.hardware_widget.on_status(reading)
+            yield laser.status, self.hardware_widget.on_status
+        yield self.hardware_widget.sig_launch, self._launch_hardware_plan
+        yield self.acq_ctrl.sig_plan_started, self.hardware_widget.plan_started
+        yield self.acq_ctrl.sig_plan_done, self.hardware_widget.plan_finished
+        yield self.acq_ctrl.sig_plan_stopped, self.hardware_widget.plan_stopped
+        yield self.acq_ctrl.sig_plan_failed, self.hardware_widget.plan_failed
+        yield self.acq_ctrl.sig_locks_changed, self.hardware_widget.set_locked
         if isinstance(self.img_widget, ImageView):
             for name in self.det_ctrl.detectors:
                 self.img_widget.attach_preview(
                     name, DetectorPreviewSource(self.preview, name)
                 )
+
+    @slot(thread="main")
+    def _launch_hardware_plan(self, plan: str, values: dict) -> None:
+        if (
+            plan not in {"holospim_laser_profile", "holospim_laser_settings"}
+            or plan not in self.acq_ctrl.plans or self._laser_name is None
+        ):
+            self.hardware_widget.plan_failed(plan, "No unique AOTF device and plan")
+            return
+        if not self.acq_ctrl.accepting_plan:
+            self.hardware_widget.plan_failed(plan, "An acquisition is already active")
+            return
+        self.acq_ctrl.launch(plan, {**values, "laser": self._laser_name})
 
 
 def run_holospim(argv: Sequence[str]) -> NoReturn:
@@ -204,8 +242,8 @@ def run_holospim(argv: Sequence[str]) -> NoReturn:
     packaged = Path(__file__).resolve().parents[1] / "profiles" / "holospim.yaml"
     try:
         config = [
-            read_instrument_profile(path)
-            for path in (args.profile or packaged, *args.overlay)
+            read_holospim_profile(args.profile or packaged),
+            *(read_instrument_profile(path) for path in args.overlay),
         ]
     except (OSError, ValueError) as error:
         parser.error(str(error))

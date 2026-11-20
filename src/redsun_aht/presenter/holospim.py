@@ -16,6 +16,7 @@ from bluesky.utils import MsgGenerator
 from redsun.engine.plan_stubs import lock_wrapper
 from redsun.registry import PlanEntry
 
+from redsun_aht.device.aaaotf import AttachedAAAOTF
 from redsun_aht.device.dynamic_patterns import DynamicPattern
 from redsun_aht.device.esp300_stage import Esp300Stage
 from redsun_aht.device.mmcore.camera import MMCamera
@@ -38,7 +39,10 @@ from redsun_aht.presenter.led_patterns import PANELS, pattern_weights
 
 logger = logging.getLogger(__name__)
 LedColor = Literal["blue", "green", "red"]
+LaserPreset = Literal["All Off", "488 nm", "561 nm"]
 _COLOR_COMMAND = {"blue": "51", "green": "52", "red": "53"}
+# Both swept settings were verified on slot 1 in separate runs.
+_LASER_RF_PRESETS = {"488 nm": (112.28, 1750), "561 nm": (92.63, 1900)}
 
 
 class HolospimPresenter:
@@ -73,6 +77,8 @@ class HolospimPresenter:
     def plan_map(self) -> Mapping[str, PlanEntry]:
         """Expose the stack only when the host supplies travel bounds."""
         plans: dict[str, PlanEntry] = {"holospim_led_blank": {"plan": self.blank}}
+        plans["holospim_laser_profile"] = {"plan": self.laser_profile}
+        plans["holospim_laser_settings"] = {"plan": self.laser_settings}
         plans["holospim_hand_eye_preview"] = {"plan": self.hand_eye_preview}
         plans["holospim_hand_eye_capture"] = {"plan": self.hand_eye_capture}
         plans["holospim_survey_z_stack"] = {"plan": self.survey_stack}
@@ -90,6 +96,53 @@ class HolospimPresenter:
     def blank(self, mcu: PvaUnifiedMcu) -> MsgGenerator[None]:
         """Blank the HoloSPIM LED panel through its serial owner."""
         yield from bps.abs_set(mcu.illumination, "00", wait=True)
+
+    def laser_settings(
+        self, laser: AttachedAAAOTF, channel: int, frequency_mhz: float,
+        maximum_intensity: int, power_percent: float,
+    ) -> MsgGenerator[None]:
+        """Close all slots and edit RF settings through the leased service."""
+        if (
+            type(channel) is not int or not 1 <= channel <= 8
+            or type(maximum_intensity) is not int or not 0 <= maximum_intensity <= 2200
+            or not math.isfinite(frequency_mhz) or not 50 <= frequency_mhz <= 200
+            or not math.isfinite(power_percent) or not 0 <= power_percent <= 100
+        ):
+            raise ValueError("AOTF settings exceed the adapter ranges")
+
+        def apply() -> MsgGenerator[None]:
+            yield from bps.abs_set(laser, "all_off", wait=True)
+            yield from bps.abs_set(laser, {
+                "Channel": channel, "Frequency (MHz)": frequency_mhz,
+                "Maximum intensity (dB)": maximum_intensity,
+                "Power (% of max)": power_percent,
+            }, wait=True)
+
+        yield from lock_wrapper(apply(), laser)
+
+    def laser_profile(
+        self, laser: AttachedAAAOTF, profile: LaserPreset = "All Off"
+    ) -> MsgGenerator[None]:
+        """Apply a HoloSPIM laser preset through the open AAAOTF service."""
+        preset = _LASER_RF_PRESETS.get(profile)
+        if preset is None:
+            command = "all_off" if profile == "All Off" else profile
+            yield from lock_wrapper(bps.abs_set(laser, command, wait=True), laser)
+            return
+
+        frequency, intensity = preset
+
+        def switch_wavelength() -> MsgGenerator[None]:
+            yield from bps.abs_set(laser, "all_off", wait=True)
+            yield from bps.abs_set(laser, {
+                "Channel": 1,
+                "Frequency (MHz)": frequency,
+                "Maximum intensity (dB)": intensity,
+                "Power (% of max)": 100,
+                "State": 1,
+            }, wait=True)
+
+        yield from lock_wrapper(switch_wavelength(), laser)
 
     def x28_readback(self, mcu: PvaUnifiedMcu) -> MsgGenerator[None]:
         """Record controller-reported X28 position, speed and drive flags."""
