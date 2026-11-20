@@ -74,6 +74,9 @@ session. The `camera` and `dpct` commands are separate GUI entry points.
 
 ## DPCT plan
 
+For recorded TIFFs, see [offline DPCT reconstruction](docs/index.md#offline-dpct-reconstruction)
+and [offline linear IDT reconstruction](docs/index.md#offline-linear-idt-reconstruction).
+
 `redsun_aht.plans.dpct_software.software_dpct_plan` is the session's DPCT action.
 It selects `11`, `12`, `13`, `14` in order, reads a fresh frame from each free-running
 camera after each pattern, and stores the pixels with their pattern identity. It

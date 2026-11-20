@@ -361,7 +361,7 @@ def _build_parser() -> argparse.ArgumentParser:
         dest="list_entries",
         help="list the configured sessions and services",
     )
-    subparsers = parser.add_subparsers(dest="command", metavar="{session,service}")
+    subparsers = parser.add_subparsers(dest="command")
     for kind, summary in (
         ("session", "run one configured session (usually a Qt application)"),
         ("service", "run one configured PVA service"),
@@ -373,6 +373,30 @@ def _build_parser() -> argparse.ArgumentParser:
             nargs=argparse.REMAINDER,
             help=f"arguments passed through to the {kind}; separate them with '--'",
         )
+    recon = subparsers.add_parser(
+        "reconstruct-tiff", help="reconstruct DPCT or IDT from TIFF"
+    )
+    recon.add_argument("--solver", choices=("dpct", "idt"), default="dpct")
+    recon.add_argument("--sample", type=Path, required=True)
+    recon.add_argument("--reference", type=Path)
+    recon.add_argument("--config", type=Path, required=True)
+    recon.add_argument("--output", type=Path, required=True)
+    recon.add_argument("--backend", choices=("numpy", "cupy"), default="numpy")
+    recon.add_argument("--gpu-id", type=int, default=0)
+    recon.add_argument("--method", choices=("tikhonov", "tv", "linear"))
+    recon.add_argument("--tile-size", metavar="HEIGHT,WIDTH")
+    recon.add_argument("--output-dtype", choices=("uint16", "float32"))
+    recon.add_argument(
+        "--median-output", type=Path, help="save the matched IDT reference as CYX"
+    )
+    recon.add_argument("--roi", metavar="Y,X,HEIGHT,WIDTH")
+    recon.add_argument("--zero-policy", choices=("error", "neutral"), default="error")
+    migration = subparsers.add_parser(
+        "migrate-recon-config", help="migrate legacy DPCT YAML"
+    )
+    migration.add_argument("--solver", choices=("dpct",), default="dpct")
+    migration.add_argument("--input", type=Path, required=True)
+    migration.add_argument("--output", type=Path, required=True)
     return parser
 
 
@@ -408,10 +432,74 @@ def main(argv: Sequence[str] | None = None) -> int:
     if options.command is None:
         parser.print_usage(sys.stderr)
         print(
-            "aht: error: a command is required (session, service, --check, --list)",
+            "aht: error: a command is required",
             file=sys.stderr,
         )
         return 2
+
+    if options.command in {"reconstruct-tiff", "migrate-recon-config"}:
+        try:
+            import yaml
+
+            if options.command == "reconstruct-tiff":
+                common = (
+                    options.sample,
+                    options.reference,
+                    options.config,
+                    options.output,
+                    options.roi,
+                    options.zero_policy,
+                )
+                if options.solver == "idt":
+                    from .idt_tiff import reconstruct as reconstruct_idt
+
+                    if (
+                        options.method not in (None, "linear")
+                        or options.tile_size
+                        or options.output_dtype == "uint16"
+                    ):
+                        raise ValueError(
+                            "IDT supports the linear method and float32 output"
+                        )
+                    reconstruct_idt(
+                        *common,
+                        backend=options.backend,
+                        gpu_id=options.gpu_id,
+                        median_output=options.median_output,
+                    )
+                else:
+                    from .dpct_tiff import reconstruct as reconstruct_dpct
+
+                    if options.median_output is not None:
+                        raise ValueError("--median-output is available for IDT")
+                    reconstruct_dpct(
+                        *common,
+                        backend=options.backend,
+                        gpu_id=options.gpu_id,
+                        method=options.method,
+                        tile_size=options.tile_size,
+                        output_dtype=options.output_dtype or "uint16",
+                    )
+            else:
+                from .dpct_tiff import migrate_config
+
+                config = migrate_config(options.input)
+                with options.output.open("x", encoding="utf-8") as stream:
+                    yaml.safe_dump(config, stream, sort_keys=False)
+        except (
+            OSError,
+            ValueError,
+            KeyError,
+            TypeError,
+            RuntimeError,
+            MemoryError,
+            ImportError,
+            yaml.YAMLError,
+        ) as error:
+            print(f"aht: error: {error}", file=sys.stderr)
+            return 1
+        print(options.output)
+        return 0
 
     registry = load_registry()
     entries = registry.sessions if options.command == "session" else registry.services

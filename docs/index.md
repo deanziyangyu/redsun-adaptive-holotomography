@@ -79,6 +79,91 @@ FastCS service → ophyd-async device → Bluesky plan → RunEngine documents
 | `contracts/`, `plans/` | Acquisition requests, frame and run identity, and plan orchestration |
 | `presenter/`, `view/` | Run-document routing, detector controls and image display |
 | `storage/` | Zarr frame storage, manifests and plane receipts |
+| `dpct_tiff.py`, `idt_tiff.py`, `scientific/reconstruction/` | Offline TIFF loading, DPCT and linear IDT kernels, and output provenance |
+
+## Offline DPCT reconstruction
+
+```mermaid
+flowchart LR
+    I[Declared-axis TIFFs and YAML] --> P[DPCT normalization by Z plane]
+    I --> Q[IDT channel-wise reference and illumination calibration]
+    P --> T[XY-tiled DPCT]
+    Q --> L[Linear Fourier IDT through optical defocus]
+    T --> O[ImageJ RI TIFF and provenance]
+    L --> O
+```
+
+```console
+aht reconstruct-tiff --solver dpct --sample sample.tif --reference background.tif --config reconstruction.yaml --output ri.tif
+```
+
+The sample must declare `ZCYX` with four illumination channels. The matched
+background can declare `CYX` for a broadcast reference, `TCYX` for a per-shot
+median over repeats, or `ZCYX` for one reference per plane. Supply a legacy DPCT
+YAML directly or export the schema
+version 1 form with `aht migrate-recon-config --solver dpct --input legacy.yaml
+--output reconstruction.yaml`. Set `--roi Y,X,HEIGHT,WIDTH` to select the same
+zero-based region in both TIFFs. DPCT supports `--method tikhonov` and `--method tv`.
+The method and tile geometry can also come from the YAML. Override tile size with
+`--tile-size HEIGHT,WIDTH`. Legacy migration preserves the effective TV weight
+used by the legacy 3D solver. In native YAML, `dpct_tv_weight`, `dpct_admm_rho`,
+and `dpct_tv_iterations` explicitly control the solve.
+
+Normalization rejects zero-valued sample or reference pixels by default. Use
+`--zero-policy neutral` to replace their ratios with 1. The JSON provenance
+records how many values were replaced, input and output SHA-256 digests,
+optical settings and the tile layout.
+
+Both NumPy and CuPy run offline. Install the `gpu-cupy` extra for CUDA 12 and
+select `--backend cupy --gpu-id 0` to use a GPU. Scratch files are created beside
+the output. DPCT writes an ImageJ `ZYX` TIFF in legacy `uint16` RI × 10,000
+encoding by default. Use `--output-dtype float32` for absolute RI. Both solvers
+refuse existing output or provenance files. The DPCT transfer functions and tiler come from AHT
+revision `cbc0b4ed4d1c4c0d04afedcd6106e38fbf234e4c`.
+
+## Offline linear IDT reconstruction
+
+```console
+aht reconstruct-tiff --solver idt --sample sample.tif --reference repeats.tif --config idt.yaml --backend cupy --median-output median.tif --output ri.tif
+```
+
+IDT expects a single-focus `CYX` sample and a matching `CYX` reference or
+`TCYX` repeats. The optional `--median-output` writes the exact per-shot reference
+in float32, beside the reconstruction. The float32 reconstruction contains
+absolute RI evaluated at the model defocus values in the provenance JSON.
+The illumination file must follow the TIFF channel order. Named sample and
+reference channels must agree. IDT also checks its calibration LED indices when
+the TIFFs and calibration supply them. Paths in YAML are
+relative to the YAML file. Install `offline-idt` for HDF5 and MATLAB calibration
+imports and the optional detector taper.
+
+```yaml
+schema_version: 1
+optics:
+  wavelength_um: 0.465
+  pixel_size_um: 0.18333333333333332
+  pixel_size_z_um: 0.25
+  numerical_aperture: 0.95
+  refractive_index_medium: 1.35
+idt:
+  illumination_file: ordered_led_directions.mat
+  depth_range_um: [-3, 3]
+  regularization_phase: 2
+  regularization_absorption: 100
+```
+
+Use `na_list` in a MAT file for wavelength-independent directions or ordered
+`(fx, fy)` in cycles per micrometre in `.npy` or `illumination_fxy` in `.npz`.
+An HDF5 file with `Sorted_Pos` uses `illumination_geometry_na` to convert positions,
+with a default of 0.9. Keep `legacy_led_rotation: false` when the calibration
+has already been ordered in the reconstruction coordinate system. The pupil NA
+is independently specified in `optics`. An optional
+`background_footprint_fraction` rejects pixels that are below that fraction of
+their shot median in any reference shot. `background_taper_px` applies a Gaussian
+taper of the selected footprint. `--zero-policy` controls zero-valued ratios
+inside the usable footprint.
+
+## Acquisition and live preview
 
 Live preview follows per-detector Events from the run. The camera service can
 write frames directly, and software DPCT writes frames by illumination pattern.

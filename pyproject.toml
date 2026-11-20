@@ -55,6 +55,8 @@ dev = [
 
 [project.optional-dependencies]
 camera-webcam = ["opencv-python-headless==4.11.0.86"]
+gpu-cupy = ["cupy-cuda12x>=13.6,<15; sys_platform == 'win32' or sys_platform == 'linux'"]
+offline-idt = ["h5py>=3.11,<4", "scipy>=1.13,<2"]
 camera-mmcore = [
   "pymmcore==12.5.0.75.0",
   "pymmcore-plus==0.18.1",

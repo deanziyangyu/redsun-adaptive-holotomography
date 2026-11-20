@@ -7,18 +7,15 @@ description: Run a hardware-free AHT reconstruction or replay from recorded data
 
 ## Scope
 
-Reconstruction, replay and RI analysis with no session, device handle or network: a
-verified DPCT bundle on disk, or a declared-axis TIFF plus a reconstruction
-configuration. Read [AGENTS.md](../../AGENTS.md), [the
+Offline DPCT or linear IDT reconstruction without an instrument session or device handle. Use a
+declared-axis TIFF plus a reconstruction configuration. Read [AGENTS.md](../../AGENTS.md), [the
 handbook](../../AGENTS.md) and [headless testing](../../docs/index.md#testing) first.
 
 ## Preconditions
 
 - A `.venv` that imports `redsun_aht`; record interpreter and resolved versions.
-- Identified inputs: the bundle or TIFF, its manifest or declared axes, and the
-  reference/illumination/calibration the solver needs; digest anything untracked.
-- For `--backend cupy`, a visible CUDA device and a repository-local cache
-  ([runner](../../scripts/dsh/README.md)); NumPy implies no GPU.
+- Identified inputs include the TIFF axes, channel order, optical settings and
+  matching reference when background normalization is enabled.
 - No acquisition session writing the same output directory.
 
 ## Procedure
@@ -26,34 +23,24 @@ handbook](../../AGENTS.md) and [headless testing](../../docs/index.md#testing) f
 Use the CLI, not an ad-hoc script:
 
 ```powershell
-# detached solvers over a verified DPCT bundle
-.\.venv\Scripts\python.exe -m redsun_aht process-headless --input <bundle> --output <dir>
-
-# direct TIFF reconstruction, then GPU only when the device is identified and free
-.\.venv\Scripts\python.exe -m redsun_aht reconstruct-tiff --solver msbp `
-  --sample <sample.tif> --config <recon.yaml> --output <result.tif> --backend numpy
-
-# replay a completed flyer run record, then analyze the RI product
-.\.venv\Scripts\python.exe -m redsun_aht process-flyer-replay --input <run> --output <dir>
-.\.venv\Scripts\python.exe -m redsun_aht analyze-ri --input <ri.tif> --output <report>
+.\.venv\Scripts\python.exe -m redsun_aht reconstruct-tiff --solver dpct `
+  --sample <sample.tif> --reference <background.tif> --config <recon.yaml> `
+  --output <result.tif> --backend numpy
 ```
 
-Add `--backend cupy --gpu-id <n> --gpu-reservation-mib 512` to `reconstruct-tiff` only
-with a visible device. Omit `process-flyer-replay --tiled-uri` unless catalog
-registration is in scope: it contacts a Tiled server, which an offline run must not do.
+See the [offline DPCT documentation](../../docs/index.md#offline-dpct-reconstruction)
+and [linear IDT documentation](../../docs/index.md#offline-linear-idt-reconstruction)
+for NumPy and CuPy, ROI selection, reference handling, calibration and zero-pixel policy.
 
 ## Refusal conditions
 
 Refuse, naming the failed precondition, rather than improvising:
 
-- **No GPU** — `--backend cupy` with no device, driver or cache. Do not fall back
-  to NumPy and report the run as a GPU result.
 - **Missing calibration** — a required reference, illumination table, voxel size,
   wavelength or NA was not supplied. Do not substitute another dataset's value or
   an instrument default.
-- **Partial or unverified dataset** — the manifest does not verify, a detector or
-  shot is missing, or the TIFF axes are undeclared. Report partial with the
-  missing identities; do not interpolate to completion.
+- **Partial or unverified dataset** — an illumination channel is missing or
+  the TIFF axes are undeclared. Report which inputs are missing.
 - **Unidentified inputs** — a path with no provenance, or a digest that changed
   since it was described.
 
